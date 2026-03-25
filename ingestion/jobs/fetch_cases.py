@@ -36,7 +36,7 @@ logger = structlog.get_logger(__name__)
 
 _PATH = "/report/report/getCauseTitleListByCompany"
 _DEFAULT_FROM_DATE = "2015-01-01"
-_SEARCH_KEYWORD = os.environ.get("SEARCH_KEYWORD", "samsung")
+_SEARCH_KEYWORD = os.environ.get("EJAGRITI_SEARCH_KEYWORD", "samsung")
 
 _TYPE_ID_MAP: dict[CommissionType, int] = {
     CommissionType.national: 1,
@@ -119,7 +119,7 @@ def run(
     stats = {"fetched": 0, "upserted": 0, "failed": 0}
     log = logger.bind(job="fetch_cases", run_id=run_id, dry_run=dry_run)
 
-    from_date = os.environ.get("FETCH_CASES_FROM_DATE", _DEFAULT_FROM_DATE)
+    from_date = os.environ.get("EJAGRITI_FETCH_CASES_FROM_DATE", _DEFAULT_FROM_DATE)
     to_date = date.today().isoformat()
 
     commissions = _get_all_commissions()

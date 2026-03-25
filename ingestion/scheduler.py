@@ -39,9 +39,9 @@ logger = structlog.get_logger(__name__)
 
 _DATABASE_URL: str = os.environ["DATABASE_URL"]
 _BASE_URL: str     = os.environ.get("EJAGRITI_BASE_URL", "https://e-jagriti.gov.in") + "/services"
-_DAILY_BUDGET: int = int(os.environ.get("DAILY_CALL_BUDGET", "3500"))
-_MAX_CONCURRENT: int = int(os.environ.get("MAX_CONCURRENT_REQUESTS", "2"))
-_MAX_RETRIES: int    = int(os.environ.get("MAX_RETRIES", "5"))
+_DAILY_BUDGET: int = int(os.environ.get("EJAGRITI_DAILY_CALL_BUDGET", "3500"))
+_MAX_CONCURRENT: int = int(os.environ.get("EJAGRITI_MAX_CONCURRENT_REQUESTS", "2"))
+_MAX_RETRIES: int    = int(os.environ.get("EJAGRITI_MAX_RETRIES", "5"))
 
 
 def _make_client() -> EJagritiClient:
@@ -123,31 +123,31 @@ def _run_job(job_fn, *, trigger_mode: TriggerMode, dry_run: bool) -> dict:
 
 def _job_fetch_commissions() -> None:
     """APScheduler callback for fetch_commissions."""
-    dry_run = os.environ.get("DRY_RUN", "false").lower() == "true"
+    dry_run = os.environ.get("EJAGRITI_DRY_RUN", "false").lower() == "true"
     _run_job(fetch_commissions.run, trigger_mode=TriggerMode.scheduler, dry_run=dry_run)
 
 
 def _job_fetch_cases() -> None:
     """APScheduler callback for fetch_cases."""
-    dry_run = os.environ.get("DRY_RUN", "false").lower() == "true"
+    dry_run = os.environ.get("EJAGRITI_DRY_RUN", "false").lower() == "true"
     _run_job(fetch_cases.run, trigger_mode=TriggerMode.scheduler, dry_run=dry_run)
 
 
 def _job_fetch_case_detail() -> None:
     """APScheduler callback for fetch_case_detail."""
-    dry_run = os.environ.get("DRY_RUN", "false").lower() == "true"
+    dry_run = os.environ.get("EJAGRITI_DRY_RUN", "false").lower() == "true"
     _run_job(fetch_case_detail.run, trigger_mode=TriggerMode.scheduler, dry_run=dry_run)
 
 
 def _job_fetch_orders() -> None:
     """APScheduler callback for fetch_orders."""
-    dry_run = os.environ.get("DRY_RUN", "false").lower() == "true"
+    dry_run = os.environ.get("EJAGRITI_DRY_RUN", "false").lower() == "true"
     _run_job(fetch_orders.run, trigger_mode=TriggerMode.scheduler, dry_run=dry_run)
 
 
 def _job_fetch_judgments() -> None:
     """APScheduler callback for fetch_judgments."""
-    dry_run = os.environ.get("DRY_RUN", "false").lower() == "true"
+    dry_run = os.environ.get("EJAGRITI_DRY_RUN", "false").lower() == "true"
     _run_job(fetch_judgments.run, trigger_mode=TriggerMode.scheduler, dry_run=dry_run)
 
 

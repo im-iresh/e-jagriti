@@ -3,17 +3,17 @@ Ingestion service entry point.
 
 Reads RUN_ONCE and DRY_RUN environment variables to select the operating mode:
 
-  RUN_ONCE=false (default):
+  EJAGRITI_RUN_ONCE=false (default):
     Starts an APScheduler BackgroundScheduler that runs jobs on a daily cron
     schedule.  The process runs indefinitely until SIGTERM or SIGINT.
 
-  RUN_ONCE=true:
+  EJAGRITI_RUN_ONCE=true:
     Executes the full ingestion pipeline once (commissions → cases →
     case_detail → orders → judgments) and exits with code 0 on success or
     code 1 on unhandled error.  Suitable for Cloud Run Jobs / ECS Scheduled
     Tasks.
 
-  DRY_RUN=true:
+  EJAGRITI_DRY_RUN=true:
     Can be combined with either mode. Fetches data from the eJagriti API but
     skips all database writes. Useful for smoke-testing connectivity without
     side effects.
@@ -47,7 +47,7 @@ def _configure_logging() -> None:
     """
     import logging
 
-    log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
+    log_level = os.environ.get("EJAGRITI_LOG_LEVEL", "INFO").upper()
     logging.basicConfig(
         format="%(message)s",
         stream=sys.stdout,
@@ -79,15 +79,15 @@ def main() -> None:
     _configure_logging()
     log = structlog.get_logger(__name__)
 
-    run_once = os.environ.get("RUN_ONCE", "false").lower() == "true"
-    dry_run  = os.environ.get("DRY_RUN",  "false").lower() == "true"
+    run_once = os.environ.get("EJAGRITI_RUN_ONCE", "false").lower() == "true"
+    dry_run  = os.environ.get("EJAGRITI_DRY_RUN",  "false").lower() == "true"
 
     log.info(
         "ingestion_service_starting",
         run_once=run_once,
         dry_run=dry_run,
-        search_keyword=os.environ.get("SEARCH_KEYWORD", "samsung"),
-        daily_budget=os.environ.get("DAILY_CALL_BUDGET", "3500"),
+        search_keyword=os.environ.get("EJAGRITI_SEARCH_KEYWORD", "samsung"),
+        daily_budget=os.environ.get("EJAGRITI_DAILY_CALL_BUDGET", "3500"),
     )
 
     # Verify DB connectivity before doing any work

@@ -14,7 +14,7 @@ from contextlib import contextmanager
 from typing import Generator
 
 import structlog
-from sqlalchemy import create_engine, event, text
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session, sessionmaker
 
 logger = structlog.get_logger(__name__)
@@ -57,8 +57,8 @@ def _get_engines():
         if not db_url:
             raise RuntimeError("DATABASE_URL environment variable is not set")
 
-        pool_size   = int(os.environ.get("SA_POOL_SIZE", "5"))
-        max_overflow = int(os.environ.get("SA_MAX_OVERFLOW", "10"))
+        pool_size   = int(os.environ.get("EJAGRITI_SA_POOL_SIZE", "5"))
+        max_overflow = int(os.environ.get("EJAGRITI_SA_MAX_OVERFLOW", "10"))
 
         _primary_engine = _build_engine(db_url, pool_size, max_overflow)
         _SessionFactory = sessionmaker(bind=_primary_engine, expire_on_commit=False)

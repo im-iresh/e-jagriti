@@ -38,7 +38,7 @@ logger = structlog.get_logger(__name__)
 
 _PATH = "/courtmaster/courtRoom/judgement/v1/getDailyOrderJudgementPdf"
 _BATCH_SIZE = 100
-_PDF_STORAGE_DIR = os.environ.get("PDF_STORAGE_DIR", "")
+_PDF_STORAGE_DIR = os.environ.get("EJAGRITI_PDF_STORAGE_DIR", "")
 _AWS_S3_BUCKET = os.environ.get("AWS_S3_BUCKET", "")
 
 

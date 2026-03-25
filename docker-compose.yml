@@ -48,15 +48,19 @@ services:
       dockerfile: Dockerfile
     restart: unless-stopped
     environment:
+      # Platform-standard
       DATABASE_URL: postgresql://${POSTGRES_USER:-ejagriti}:${POSTGRES_PASSWORD:-ejagriti_secret}@postgres:5432/${POSTGRES_DB:-ejagriti}
+      # eJagriti custom
       EJAGRITI_BASE_URL: ${EJAGRITI_BASE_URL:-https://e-jagriti.gov.in}
-      RUN_ONCE: ${RUN_ONCE:-false}
-      DRY_RUN: ${DRY_RUN:-false}
-      LOG_LEVEL: ${LOG_LEVEL:-INFO}
-      SEARCH_KEYWORD: ${SEARCH_KEYWORD:-samsung}
-      DAILY_CALL_BUDGET: ${DAILY_CALL_BUDGET:-3500}
-      MAX_CONCURRENT_REQUESTS: ${MAX_CONCURRENT_REQUESTS:-2}
-      MAX_RETRIES: ${MAX_RETRIES:-5}
+      EJAGRITI_RUN_ONCE: ${EJAGRITI_RUN_ONCE:-false}
+      EJAGRITI_DRY_RUN: ${EJAGRITI_DRY_RUN:-false}
+      EJAGRITI_LOG_LEVEL: ${EJAGRITI_LOG_LEVEL:-INFO}
+      EJAGRITI_SEARCH_KEYWORD: ${EJAGRITI_SEARCH_KEYWORD:-samsung}
+      EJAGRITI_DAILY_CALL_BUDGET: ${EJAGRITI_DAILY_CALL_BUDGET:-3500}
+      EJAGRITI_MAX_CONCURRENT_REQUESTS: ${EJAGRITI_MAX_CONCURRENT_REQUESTS:-2}
+      EJAGRITI_MAX_RETRIES: ${EJAGRITI_MAX_RETRIES:-5}
+      EJAGRITI_PDF_STORAGE_DIR: ${EJAGRITI_PDF_STORAGE_DIR:-}
+      AWS_S3_BUCKET: ${AWS_S3_BUCKET:-}
     depends_on:
       postgres:
         condition: service_healthy
@@ -73,13 +77,17 @@ services:
     ports:
       - "8000:8000"
     environment:
+      # Platform-standard
       DATABASE_URL: postgresql://${POSTGRES_USER:-ejagriti}:${POSTGRES_PASSWORD:-ejagriti_secret}@postgres:5432/${POSTGRES_DB:-ejagriti}
       REPLICA_DATABASE_URL: ${REPLICA_DATABASE_URL:-}
       REDIS_URL: redis://redis:6379/0
       SECRET_KEY: ${SECRET_KEY:-change-me-in-production}
-      LOG_LEVEL: ${LOG_LEVEL:-INFO}
-      RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-100}
-      CACHE_TTL_SECONDS: ${CACHE_TTL_SECONDS:-3600}
+      # eJagriti custom
+      EJAGRITI_LOG_LEVEL: ${EJAGRITI_LOG_LEVEL:-INFO}
+      EJAGRITI_RATE_LIMIT_PER_MINUTE: ${EJAGRITI_RATE_LIMIT_PER_MINUTE:-100}
+      EJAGRITI_CACHE_TTL_SECONDS: ${EJAGRITI_CACHE_TTL_SECONDS:-3600}
+      EJAGRITI_SA_POOL_SIZE: ${EJAGRITI_SA_POOL_SIZE:-5}
+      EJAGRITI_SA_MAX_OVERFLOW: ${EJAGRITI_SA_MAX_OVERFLOW:-10}
     depends_on:
       postgres:
         condition: service_healthy

@@ -35,22 +35,22 @@ class Config:
     # Flask-Caching
     CACHE_TYPE: str = "RedisCache" if os.environ.get("REDIS_URL") else "SimpleCache"
     CACHE_REDIS_URL: str = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
-    CACHE_DEFAULT_TIMEOUT: int = int(os.environ.get("CACHE_TTL_SECONDS", "3600"))
+    CACHE_DEFAULT_TIMEOUT: int = int(os.environ.get("EJAGRITI_CACHE_TTL_SECONDS", "3600"))
 
     # Flask-Limiter
     RATELIMIT_STORAGE_URI: str = os.environ.get("REDIS_URL", "memory://")
-    RATELIMIT_DEFAULT: str = f"{os.environ.get('RATE_LIMIT_PER_MINUTE', '100')} per minute"
+    RATELIMIT_DEFAULT: str = f"{os.environ.get('EJAGRITI_RATE_LIMIT_PER_MINUTE', '100')} per minute"
 
     # SQLAlchemy connection pool
-    SA_POOL_SIZE: int = int(os.environ.get("SA_POOL_SIZE", "5"))
-    SA_MAX_OVERFLOW: int = int(os.environ.get("SA_MAX_OVERFLOW", "10"))
+    SA_POOL_SIZE: int = int(os.environ.get("EJAGRITI_SA_POOL_SIZE", "5"))
+    SA_MAX_OVERFLOW: int = int(os.environ.get("EJAGRITI_SA_MAX_OVERFLOW", "10"))
 
     # Pagination defaults
     DEFAULT_PER_PAGE: int = 20
     MAX_PER_PAGE: int = 100
 
     # Logging
-    LOG_LEVEL: str = os.environ.get("LOG_LEVEL", "INFO").upper()
+    LOG_LEVEL: str = os.environ.get("EJAGRITI_LOG_LEVEL", "INFO").upper()
 
 
 class TestingConfig(Config):
