@@ -1,0 +1,61 @@
+## Confirmed API endpoints and field mappings
+
+Base URL: https://e-jagriti.gov.in/services
+
+GET /master/master/v2/getAllCommission
+  → commissions[].commissionId        -> commission_id_ext
+  → commissions[].commissionNameEn    -> name_en
+  → commissions[].stateId             -> state_id
+  (no commissionTypeId here — all are state-level or NCDRC)
+
+GET /master/master/v2/getCommissionDetailsByStateId?stateId=N
+  → data[].commissionId               -> commission_id_ext
+  → data[].commissionNameEn           -> name_en
+  → data[].commissionTypeId           -> 2=state, 3=district
+  → data[].districtId                 -> district_id
+  → data[].casePrefixText             -> case_prefix_text
+
+GET /report/report/getCauseTitleListByCompany
+  ?commissionTypeId=N&commissionId=N&filingDate1=YYYY-MM-DD&filingDate2=YYYY-MM-DD
+  &complainant_respondent_name_en=samsung
+  → array of case list items (lightweight — no hearing details)
+  Key fields: case_number, case_stage_name, case_category_name,
+              complainant_name, respondent_name,
+              complainant_advocate_name, respondent_advocate_name,
+              case_filing_date, date_of_hearing, date_of_next_hearing,
+              commission_type_en
+
+GET /case/caseFilingService/v2/getCaseStatus?caseNumber=DC%2F77%2FCC%2F104%2F2025
+  → data.caseNumber                   -> case_number
+  → data.fillingReferenceNumber       -> filing_reference_number (NOTE: double-l typo in API)
+  → data.caseFilingDate               -> filing_date
+  → data.dateOfCause                  -> date_of_cause
+  → data.filedInComissionName         -> matches commission.name_en
+  → data.caseStage                    -> case_stage_name
+  → data.caseStageId                  -> case_stage_id
+  → data.complainant                  -> complainant_name
+  → data.respondent                   -> respondent_name
+  → data.complainantAdvocate[]        -> complainant_advocate_names (JSON array)
+  → data.respondentAdvocate[]         -> respondent_advocate_names (JSON array)
+  → data.caseHearingDetails[]         -> hearings table (one row per entry)
+    → courtRoomHearingId              -> court_room_hearing_id (upsert key)
+    → dateOfHearing                   -> date_of_hearing
+    → dateOfNextHearing               -> date_of_next_hearing
+    → caseStage                       -> case_stage
+    → proceedingText                  -> proceeding_text (HTML blob)
+    → dailyOrderStatus                -> daily_order_status
+    → orderTypeId                     -> order_type_id
+    → dailyOrderAvailabilityStatus    -> daily_order_availability_status (2 = fetch PDF)
+    → hearingSequenceNumber           -> hearing_sequence_number
+
+GET /courtmaster/courtRoom/judgement/v1/getDailyOrderJudgementPdf
+  ?filingReferenceNumber=N&dateOfHearing=YYYY-MM-DD&orderTypeId=N
+  → data.dailyOrderPdf                -> base64 string — decode + upload to S3,
+                                         store path in daily_orders.pdf_storage_path
+
+## Important API quirks to handle
+- fillingReferenceNumber has a double-l typo in the API response — parse accordingly
+- date_of_hearing can be null (sequence 0 hearings / future slots)
+- proceeding_text is null for future/placeholder hearings
+- daily_order_availability_status = 2 means PDF is ready to fetch
+- getCauseTitleListByCompany does NOT return fillingReferenceNumber — need getCaseStatus for that
