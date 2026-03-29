@@ -335,7 +335,10 @@ class IngestionError(Base):
     case_id: Mapped[Optional[int]]           = mapped_column(BigInteger, nullable=True)
     endpoint: Mapped[str]                    = mapped_column(String(512), nullable=False)
     http_status: Mapped[Optional[int]]       = mapped_column(Integer, nullable=True)
-    error_type: Mapped[ErrorType]            = mapped_column(Enum(ErrorType, name="error_type_enum"), nullable=False, default=ErrorType.unknown)
+    error_type: Mapped[ErrorType]            = mapped_column(
+        Enum(ErrorType, name="error_type_enum", values_callable=lambda x: [e.value for e in x]),
+        nullable=False, default=ErrorType.unknown,
+    )
     error_message: Mapped[str]               = mapped_column(Text, nullable=False)
     request_payload: Mapped[Optional[str]]   = mapped_column(Text, nullable=True)
     # Truncated response body (first 4 KB) for debugging

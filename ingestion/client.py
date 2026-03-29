@@ -195,19 +195,25 @@ class EJagritiClient:
 
                 except httpx.HTTPStatusError as exc:
                     duration_ms = int((time.monotonic() - start) * 1000)
+                    body_preview = exc.response.text[:1000] if exc.response.content else ""
                     logger.error(
                         "http_status_error",
                         endpoint=path,
                         status=exc.response.status_code,
                         attempt=attempt,
+                        response_body=body_preview,
                     )
                     last_exc = exc
-                    # Non-retryable 4xx — do not loop
+                    # Non-retryable status — do not retry
                     break
 
+        if last_exc is not None:
+            raise RuntimeError(
+                f"Non-retryable HTTP error for {url}"
+            ) from last_exc
         raise RuntimeError(
             f"Exhausted {self._max_retries} retries for {url}"
-        ) from last_exc
+        )
 
     # ------------------------------------------------------------------
     # Context manager support

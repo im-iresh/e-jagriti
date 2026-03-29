@@ -40,19 +40,49 @@ from scheduler import create_scheduler, run_once_batch  # noqa: E402
 
 def _configure_logging() -> None:
     """
-    Configure structlog for structured JSON output.
+    Configure structlog for structured JSON output to stdout and a daily
+    rotating log file.
 
-    Sets up a processing chain: timestamp → log level → JSON renderer.
-    In development set LOG_LEVEL=DEBUG to see verbose output.
+    Log files are written to EJAGRITI_LOG_DIR (default: ./logs) and rotated
+    at midnight, keeping 30 days of history. Each file is named
+    ingestion.log (current) or ingestion.log.YYYY-MM-DD (rotated).
     """
     import logging
+    from logging.handlers import TimedRotatingFileHandler
+    from pathlib import Path
 
-    log_level = os.environ.get("EJAGRITI_LOG_LEVEL", "INFO").upper()
-    logging.basicConfig(
-        format="%(message)s",
-        stream=sys.stdout,
-        level=getattr(logging, log_level, logging.INFO),
+    log_level_name = os.environ.get("EJAGRITI_LOG_LEVEL", "INFO").upper()
+    log_level = getattr(logging, log_level_name, logging.INFO)
+
+    log_dir = Path(os.environ.get("EJAGRITI_LOG_DIR", "logs"))
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    formatter = logging.Formatter("%(message)s")
+
+    # stdout handler
+    stdout_handler = logging.StreamHandler(sys.stdout)
+    stdout_handler.setFormatter(formatter)
+
+    # daily rotating file handler — rotates at midnight, keeps 30 days
+    file_handler = TimedRotatingFileHandler(
+        filename=log_dir / "ingestion.log",
+        when="midnight",
+        interval=1,
+        backupCount=30,
+        encoding="utf-8",
+        utc=True,
     )
+    file_handler.suffix = "%Y-%m-%d"
+    file_handler.setFormatter(formatter)
+
+    root_logger = logging.getLogger()
+    root_logger.setLevel(log_level)
+    root_logger.addHandler(stdout_handler)
+    root_logger.addHandler(file_handler)
+
+    # Suppress low-level transport noise from httpx/httpcore regardless of log level
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
     structlog.configure(
         processors=[

@@ -40,7 +40,7 @@ services:
       postgres:
         condition: service_healthy
     volumes:
-      - ./migrations:/app/migrations
+      - ./migrations:/migrations
 
   ingestion:
     build:
@@ -55,6 +55,7 @@ services:
       EJAGRITI_RUN_ONCE: ${EJAGRITI_RUN_ONCE:-false}
       EJAGRITI_DRY_RUN: ${EJAGRITI_DRY_RUN:-false}
       EJAGRITI_LOG_LEVEL: ${EJAGRITI_LOG_LEVEL:-INFO}
+      EJAGRITI_LOG_DIR: ${EJAGRITI_LOG_DIR:-/app/logs}
       EJAGRITI_SEARCH_KEYWORD: ${EJAGRITI_SEARCH_KEYWORD:-samsung}
       EJAGRITI_DAILY_CALL_BUDGET: ${EJAGRITI_DAILY_CALL_BUDGET:-3500}
       EJAGRITI_MAX_CONCURRENT_REQUESTS: ${EJAGRITI_MAX_CONCURRENT_REQUESTS:-2}

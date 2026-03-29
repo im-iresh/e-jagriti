@@ -11,12 +11,29 @@ from __future__ import annotations
 import os
 import sys
 from logging.config import fileConfig
+from pathlib import Path
 
 from alembic import context
+from dotenv import load_dotenv
 from sqlalchemy import engine_from_config, pool
 
-# Make the ingestion package importable so Base and all models are found
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "ingestion"))
+# Load .env from ingestion/ (local dev) or /app/ (Docker) — no-op if missing
+_here = Path(__file__).parent
+for _candidate in (_here / ".." / "ingestion" / ".env", _here / ".." / ".env"):
+    if _candidate.exists():
+        load_dotenv(_candidate)
+        break
+
+# Make the ingestion package importable so Base and all models are found.
+# Local dev: repo/migrations/../ingestion = repo/ingestion/  (db/models.py lives there)
+# Docker:    /migrations/../ingestion doesn't exist; models are at /app/db/models.py
+_migrations_dir = os.path.dirname(os.path.abspath(__file__))
+_local_ingestion = os.path.join(_migrations_dir, "..", "ingestion")
+_docker_app      = os.path.join(_migrations_dir, "..")
+if os.path.isdir(os.path.join(_local_ingestion, "db")):
+    sys.path.insert(0, _local_ingestion)
+else:
+    sys.path.insert(0, _docker_app)
 
 from db.models import Base  # noqa: E402 — must come after sys.path update
 

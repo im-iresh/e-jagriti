@@ -23,7 +23,7 @@ from datetime import date, datetime, timezone
 from typing import Any
 
 import structlog
-from sqlalchemy import select
+from sqlalchemy import select, update as sa_update
 
 from client import EJagritiClient, calculate_interval
 from db.models import Case, ErrorType, JobType
@@ -31,7 +31,6 @@ from db.session import get_session
 from db.upsert import (
     log_failed_job,
     log_ingestion_error,
-    upsert_case,
     upsert_daily_order,
     upsert_hearing,
 )
@@ -184,7 +183,11 @@ def _process_detail(
 
     try:
         with get_session() as session:
-            upsert_case(session, case_update)
+            # Case already exists in DB (we queried it to get here) — UPDATE only,
+            # never INSERT, so commission_id (not in case_update) is preserved.
+            session.execute(
+                sa_update(Case).where(Case.case_number == case_number).values(**case_update)
+            )
 
             for h in hearings:
                 court_id = str(h.get("courtRoomHearingId", ""))

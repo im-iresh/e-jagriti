@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import sqlalchemy as sa
 from alembic import op
+from sqlalchemy.dialects.postgresql import ENUM as pg_enum
 
 revision: str = "0001"
 down_revision: str | None = None
@@ -66,8 +67,9 @@ def upgrade() -> None:
         sa.Column("id",                            sa.BigInteger(),  primary_key=True, autoincrement=True),
         sa.Column("commission_id_ext",             sa.BigInteger(),  nullable=False),
         sa.Column("name_en",                       sa.String(255),   nullable=False),
-        sa.Column("commission_type",               sa.Enum("national", "state", "district",
-                                                           name="commission_type_enum"), nullable=False),
+        sa.Column("commission_type",               pg_enum("national", "state", "district",
+                                                            name="commission_type_enum",
+                                                            create_type=False), nullable=False),
         sa.Column("state_id",                      sa.Integer(),     nullable=True),
         sa.Column("district_id",                   sa.Integer(),     nullable=True),
         sa.Column("case_prefix_text",              sa.String(50),    nullable=True),
@@ -106,7 +108,8 @@ def upgrade() -> None:
         sa.Column("respondent_name",           sa.String(500),   nullable=True),
         sa.Column("complainant_advocate_names",sa.Text(),        nullable=True),
         sa.Column("respondent_advocate_names", sa.Text(),        nullable=True),
-        sa.Column("status", sa.Enum("open", "closed", "pending", name="case_status_enum"),
+        sa.Column("status", pg_enum("open", "closed", "pending", name="case_status_enum",
+                                    create_type=False),
                   nullable=False, server_default="pending"),
         sa.Column("data_hash",         sa.String(32),              nullable=True),
         sa.Column("last_fetched_at",   sa.DateTime(timezone=True), nullable=True),
@@ -195,8 +198,9 @@ def upgrade() -> None:
         sa.Column("fail_count",       sa.Integer(), nullable=False, server_default="0"),
         sa.Column("skip_count",       sa.Integer(), nullable=False, server_default="0"),
         sa.Column("duration_seconds", sa.Float(),   nullable=True),
-        sa.Column("trigger_mode",     sa.Enum("scheduler", "run_once", "manual",
-                                              name="trigger_mode_enum"),
+        sa.Column("trigger_mode",     pg_enum("scheduler", "run_once", "manual",
+                                              name="trigger_mode_enum",
+                                              create_type=False),
                   nullable=False, server_default="scheduler"),
         sa.Column("notes",            sa.Text(),    nullable=True),
         sa.PrimaryKeyConstraint("id", name="pk_ingestion_runs"),
@@ -213,9 +217,10 @@ def upgrade() -> None:
         sa.Column("case_id",          sa.BigInteger(), nullable=True),
         sa.Column("endpoint",         sa.String(512),  nullable=False),
         sa.Column("http_status",      sa.Integer(),    nullable=True),
-        sa.Column("error_type",       sa.Enum("HTTP_ERROR", "PARSE_ERROR", "DB_ERROR",
+        sa.Column("error_type",       pg_enum("HTTP_ERROR", "PARSE_ERROR", "DB_ERROR",
                                               "TIMEOUT", "RATE_LIMITED", "UNKNOWN",
-                                              name="error_type_enum"),
+                                              name="error_type_enum",
+                                              create_type=False),
                   nullable=False, server_default="UNKNOWN"),
         sa.Column("error_message",    sa.Text(),       nullable=False),
         sa.Column("request_payload",  sa.Text(),       nullable=True),
@@ -235,9 +240,10 @@ def upgrade() -> None:
     op.create_table(
         "failed_jobs",
         sa.Column("id",                 sa.BigInteger(), primary_key=True, autoincrement=True),
-        sa.Column("job_type",           sa.Enum("fetch_commissions", "fetch_cases",
+        sa.Column("job_type",           pg_enum("fetch_commissions", "fetch_cases",
                                                 "fetch_case_detail", "fetch_daily_order",
-                                                name="job_type_enum"), nullable=False),
+                                                name="job_type_enum",
+                                                create_type=False), nullable=False),
         sa.Column("case_id",            sa.BigInteger(), nullable=True),
         sa.Column("commission_id",      sa.BigInteger(), nullable=True),
         sa.Column("endpoint",           sa.String(512),  nullable=False),

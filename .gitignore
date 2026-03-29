@@ -1,1 +1,4 @@
 __pycache__/
+ingestion/logs
+.vscode/settings.json
+ingestion/daily_orders
