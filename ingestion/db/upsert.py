@@ -36,6 +36,7 @@ from db.models import (
     IngestionRun,
     JobType,
     TriggerMode,
+    VocComplaint,
 )
 
 logger = structlog.get_logger(__name__)
@@ -429,3 +430,43 @@ def log_api_call(
         user_agent=user_agent,
     )
     session.add(log)
+
+
+# ---------------------------------------------------------------------------
+# VOC complaint upsert
+# ---------------------------------------------------------------------------
+
+def upsert_voc_complaint(session: Session, data: dict[str, Any]) -> int:
+    """
+    Insert or update a voc_complaints row.
+
+    Conflict key: voc_number (unique per VOC record).
+
+    Args:
+        session: Active SQLAlchemy session.
+        data: Dict matching VocComplaint columns. Must include ``voc_number``
+              and ``match_status``.
+
+    Returns:
+        Internal surrogate id of the upserted row.
+    """
+    stmt = (
+        pg_insert(VocComplaint)
+        .values(**data)
+        .on_conflict_do_update(
+            index_elements=["voc_number"],
+            set_={k: pg_insert(VocComplaint).excluded[k]
+                  for k in data
+                  if k not in ("id", "voc_number", "created_at")},
+        )
+        .returning(VocComplaint.id)
+    )
+    row_id: int = session.execute(stmt).scalar_one()
+    logger.debug(
+        "upsert_voc_complaint",
+        voc_number=data.get("voc_number"),
+        match_status=data.get("match_status"),
+        case_id=data.get("case_id"),
+        row_id=row_id,
+    )
+    return row_id

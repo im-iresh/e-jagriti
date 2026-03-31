@@ -301,7 +301,40 @@ Retry queue for jobs that failed after exhausting all retries. Unlike `ingestion
 
 ---
 
-### 3.8 `api_call_log`
+### 3.8 `voc_complaints`
+
+Links VOC (Voice of Customer) complaint numbers from a separate complaints portal to cases in this DB. Populated by the `fetch_voc` job. The matching process maps VOC's court name + state → commission → constructs the full case_number → looks up the case.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | `bigint PK` | |
+| `voc_number` | `bigint UNIQUE NOT NULL` | VOC identifier (e.g. `310256328`) |
+| `case_id` | `bigint FK → cases.id SET NULL` | Linked case; NULL if no match was found |
+| `state_id` | `integer` | State ID from the VOC record; used to find the right commission |
+| `court_name` | `varchar(255)` | Raw court name string from the VOC portal |
+| `case_number_raw` | `varchar(100)` | Case number **without** commission prefix (e.g. `CC/104/2025`) |
+| `match_status` | `enum` | `matched`, `unmatched`, or `ambiguous` — see below |
+| `raw_payload` | `text` | Full original VOC record JSON (for debugging) |
+| `created_at`, `updated_at` | `timestamptz` | Auto-managed |
+
+**Upsert key:** `voc_number`
+
+**`match_status` values:**
+
+| Value | Meaning |
+|-------|---------|
+| `matched` | Commission and case both found; `case_id` is populated |
+| `unmatched` | No matching commission or case found; `case_id` is NULL |
+| `ambiguous` | Multiple commissions matched the court name; first result used; `case_id` may be populated |
+
+**Indexes:**
+- `idx_voc_case_id` on `case_id`
+- `idx_voc_match_status` on `match_status`
+- `idx_voc_state_id` on `state_id`
+
+---
+
+### 3.9 `api_call_log`
 
 Low-level log of every outbound HTTP request. Used for rate-limit auditing, 429 debugging, and performance profiling. High write volume — consider a TTL purge job (keep last 90 days) in production.
 
@@ -335,6 +368,7 @@ All enums are created as native PostgreSQL enum types and enforced at the DB lev
 | `trigger_mode_enum` | `scheduler`, `run_once`, `manual` |
 | `error_type_enum` | `HTTP_ERROR`, `PARSE_ERROR`, `DB_ERROR`, `TIMEOUT`, `RATE_LIMITED`, `UNKNOWN` |
 | `job_type_enum` | `fetch_commissions`, `fetch_cases`, `fetch_case_detail`, `fetch_daily_order` |
+| `voc_match_status_enum` | `matched`, `unmatched`, `ambiguous` |
 
 > **Note on `error_type_enum`:** The Python enum uses lowercase names (`http_error`) but uppercase values (`HTTP_ERROR`). SQLAlchemy is configured with `values_callable=lambda x: [e.value for e in x]` to store the uppercase value (what PostgreSQL expects), not the attribute name.
 
@@ -483,11 +517,12 @@ All jobs use `replace_existing=True` so updated schedules take effect on restart
 |------------|-----|-------------|
 | 00:00 | `fetch_commissions` | Refresh all ~700+ commission records |
 | 01:00 | `fetch_cases` | Scan all commissions for Samsung cases |
+| 03:00 | `fetch_voc` | Match VOC complaints to cases |
 | 06:00 | `fetch_case_detail` | Fetch full detail for cases with `last_fetched_at IS NULL` |
 | 12:00 | `fetch_orders` | Download PDFs for hearings with `pdf_fetched=False` |
 | 18:00 | `fetch_judgments` | Queue judgment PDFs for closed cases |
 
-The 6-hour spacing gives each job time to complete before the next one starts. The order matters: `fetch_cases` depends on commissions existing; `fetch_case_detail` depends on cases existing; `fetch_orders` depends on daily_order stubs created by `fetch_case_detail`.
+The ordering matters: `fetch_cases` depends on commissions existing; `fetch_voc` runs after cases are populated so the most cases are available for matching; `fetch_case_detail` depends on cases existing; `fetch_orders` depends on daily_order stubs created by `fetch_case_detail`.
 
 ### misfire_grace_time
 
@@ -1319,6 +1354,136 @@ After this job runs, `fetch_orders` will find these rows in its `WHERE pdf_fetch
 
 ---
 
+### 9.6 `fetch_voc`
+
+**Scheduled:** 03:00 UTC daily
+
+**Purpose:** Links VOC (Voice of Customer) complaint numbers from a separate complaints portal to their corresponding cases in the DB. Writes one row per VOC into the `voc_complaints` table with the match result.
+
+> **API status:** The real VOC API is not yet finalised. The job currently uses hardcoded dummy data (`_DUMMY_VOC_SOURCE` in `fetch_voc.py`). To integrate the real API, replace only the `_fetch_voc_data()` function — no other code changes are needed.
+
+---
+
+#### Data source
+
+```python
+# ingestion/jobs/fetch_voc.py
+
+_DUMMY_VOC_SOURCE = [
+    {
+        "vocNumber": 310256328,
+        "stateId": 9,
+        "courtName": "District Consumer Disputes Redressal Commission, Agra",
+        "caseNumberRaw": "CC/104/2025",
+        ...
+    },
+    ...
+]
+
+def _fetch_voc_data() -> list[dict]:
+    return _DUMMY_VOC_SOURCE   # ← swap this body for a real client.get() call
+```
+
+Each record must contain: `vocNumber`, `stateId`, `courtName`, `caseNumberRaw`. All other fields (complainant name, product category, etc.) are stored verbatim in `raw_payload` as JSON.
+
+---
+
+#### Matching logic — `_find_matching_case(state_id, court_name, case_number_raw)`
+
+The job does NOT call any API itself for matching — it queries our own DB:
+
+**Step 1 — Find commission:**
+```sql
+SELECT id, name_en, case_prefix_text
+  FROM commissions
+ WHERE state_id = :state_id
+   AND name_en ILIKE '%{court_name}%'
+```
+
+- 0 results → `match_status = unmatched`, `case_id = NULL`
+- >1 result → `match_status = ambiguous`, use first result, log warning
+- 1 result → `match_status = matched` (so far)
+- Commission has no `case_prefix_text` → `match_status = unmatched`
+
+**Step 2 — Construct full case_number:**
+```
+full_case_number = commission.case_prefix_text + "/" + case_number_raw
+# e.g.  "DC/42/CC" + "/" + "CC/104/2025"  →  "DC/42/CC/CC/104/2025"
+```
+
+**Step 3 — Find case:**
+```sql
+SELECT id FROM cases WHERE case_number = :full_case_number
+```
+
+- Found → final `match_status = matched`, `case_id` populated
+- Not found → `match_status = unmatched`, `case_id = NULL`
+
+---
+
+#### DB writes
+
+**Table:** `voc_complaints`
+**Upsert key:** `voc_number`
+**On conflict:** updates all non-key fields (re-running rematches previously-unmatched VOCs)
+
+Fields written per row:
+
+| Field | Source |
+|-------|--------|
+| `voc_number` | `vocNumber` |
+| `case_id` | Resolved by matching logic (NULL if unmatched) |
+| `state_id` | `stateId` |
+| `court_name` | `courtName` |
+| `case_number_raw` | `caseNumberRaw` |
+| `match_status` | Computed: `matched` / `unmatched` / `ambiguous` |
+| `raw_payload` | `json.dumps(record)` — full original record |
+
+---
+
+#### Stats returned
+
+```python
+{"upserted": int, "matched": int, "unmatched": int, "failed": int}
+```
+
+- `matched` + `unmatched` sum to the number of successfully processed records (regardless of DB write)
+- `upserted` counts rows written to DB
+- `failed` counts records with missing `vocNumber` or DB write errors
+
+---
+
+#### Error handling
+
+| Error | Behaviour |
+|-------|-----------|
+| No VOC records from data source | Logs `no_voc_records`, returns immediately |
+| Record missing `vocNumber` | Warning logged, `stats["failed"] += 1`, continues |
+| Commission not found for state+name | `match_status=unmatched`, row still written with `case_id=NULL` |
+| Commission has no `case_prefix_text` | `match_status=unmatched`, row still written |
+| Case not found by full case_number | `match_status=unmatched`, row still written |
+| DB upsert failure | Error logged, `stats["failed"] += 1`, continues |
+| `dry_run=True` | Matching runs, logs `dry_run_skip_voc`, skips DB write |
+
+#### Swapping in the real API
+
+When the VOC API is available, replace only `_fetch_voc_data()` in [ingestion/jobs/fetch_voc.py](ingestion/jobs/fetch_voc.py):
+
+```python
+# Before (dummy):
+def _fetch_voc_data() -> list[dict]:
+    return _DUMMY_VOC_SOURCE
+
+# After (real API):
+def _fetch_voc_data(client: EJagritiClient) -> list[dict]:
+    resp = client.get("/voc/api/complaints", params={"company": "samsung"})
+    return resp.get("data", [])
+```
+
+No changes needed to matching logic, upsert, scheduler, migration, or any other file.
+
+---
+
 ## 10. Full Data Flow
 
 The following diagram shows how data moves through the pipeline from first API call to stored PDF:
@@ -1348,6 +1513,25 @@ fetch_cases
          └─ UPSERT cases (lightweight fields only)
               upsert key: case_number
               last_fetched_at = NULL  ← signals detail job
+
+Day 1 — 03:00 UTC
+════════════════════════════════════════════════════════════════
+fetch_voc
+  │
+  ├─ _fetch_voc_data()  ← currently returns _DUMMY_VOC_SOURCE
+  │                        (replace with real API call when ready)
+  │
+  └─ For each VOC record:
+       _find_matching_case(state_id, court_name, case_number_raw)
+         │
+         ├─ SELECT commissions WHERE state_id=N AND name_en ILIKE '%court_name%'
+         │    → get case_prefix_text
+         ├─ Construct full_case_number = case_prefix_text + "/" + case_number_raw
+         └─ SELECT cases WHERE case_number = full_case_number
+              │
+              └─ UPSERT voc_complaints
+                   upsert key: voc_number
+                   match_status: matched / unmatched / ambiguous
 
 Day 1 — 06:00 UTC
 ════════════════════════════════════════════════════════════════

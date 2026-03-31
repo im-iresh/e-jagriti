@@ -33,7 +33,7 @@ from client import EJagritiClient
 from db.session import get_session
 from db.upsert import close_ingestion_run, create_ingestion_run
 from db.models import TriggerMode
-from jobs import fetch_case_detail, fetch_cases, fetch_commissions, fetch_judgments, fetch_orders
+from jobs import fetch_case_detail, fetch_cases, fetch_commissions, fetch_judgments, fetch_orders, fetch_voc
 
 logger = structlog.get_logger(__name__)
 
@@ -151,6 +151,12 @@ def _job_fetch_judgments() -> None:
     _run_job(fetch_judgments.run, trigger_mode=TriggerMode.scheduler, dry_run=dry_run)
 
 
+def _job_fetch_voc() -> None:
+    """APScheduler callback for fetch_voc."""
+    dry_run = os.environ.get("EJAGRITI_DRY_RUN", "false").lower() == "true"
+    _run_job(fetch_voc.run, trigger_mode=TriggerMode.scheduler, dry_run=dry_run)
+
+
 # ---------------------------------------------------------------------------
 # Scheduler factory
 # ---------------------------------------------------------------------------
@@ -204,6 +210,12 @@ def create_scheduler(dry_run: bool = False) -> BackgroundScheduler:
         id="fetch_judgments", replace_existing=True,
         misfire_grace_time=3600,
     )
+    scheduler.add_job(
+        _job_fetch_voc,
+        trigger="cron", hour=3, minute=0,
+        id="fetch_voc", replace_existing=True,
+        misfire_grace_time=3600,
+    )
 
     logger.info("scheduler_configured", jobs=5, dry_run=dry_run)
     return scheduler
@@ -232,6 +244,7 @@ def run_once_batch(dry_run: bool = False) -> None:
     steps = [
         fetch_commissions.run,
         fetch_cases.run,
+        fetch_voc.run,
         fetch_case_detail.run,
         fetch_orders.run,
         fetch_judgments.run,

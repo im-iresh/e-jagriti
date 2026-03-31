@@ -78,6 +78,12 @@ class TriggerMode(str, enum.Enum):
     manual    = "manual"
 
 
+class VocMatchStatus(str, enum.Enum):
+    matched   = "matched"    # case found and linked
+    unmatched = "unmatched"  # no matching case found in DB
+    ambiguous = "ambiguous"  # multiple possible commission matches; first used
+
+
 # ---------------------------------------------------------------------------
 # commissions
 # ---------------------------------------------------------------------------
@@ -166,9 +172,10 @@ class Case(Base):
     created_at: Mapped[datetime]                 = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime]                 = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
-    commission:   Mapped["Commission"]       = relationship("Commission", back_populates="cases")
-    hearings:     Mapped[list["Hearing"]]    = relationship("Hearing", back_populates="case", cascade="all, delete-orphan")
-    daily_orders: Mapped[list["DailyOrder"]] = relationship("DailyOrder", back_populates="case", cascade="all, delete-orphan")
+    commission:    Mapped["Commission"]          = relationship("Commission", back_populates="cases")
+    hearings:      Mapped[list["Hearing"]]       = relationship("Hearing", back_populates="case", cascade="all, delete-orphan")
+    daily_orders:  Mapped[list["DailyOrder"]]    = relationship("DailyOrder", back_populates="case", cascade="all, delete-orphan")
+    voc_complaints: Mapped[list["VocComplaint"]] = relationship("VocComplaint", back_populates="case")
 
     __table_args__ = (
         Index("idx_cases_commission_id",        "commission_id"),
@@ -433,3 +440,53 @@ class ApiCallLog(Base):
 
     def __repr__(self) -> str:
         return f"<ApiCallLog id={self.id} endpoint={self.endpoint!r} code={self.response_code} duration={self.duration_ms}ms>"
+
+
+# ---------------------------------------------------------------------------
+# voc_complaints
+# ---------------------------------------------------------------------------
+
+class VocComplaint(Base):
+    """
+    Links a VOC (Voice of Customer) complaint number to a case in our DB.
+
+    VOC records originate from a separate complaints portal. The matching
+    process uses state_id + court_name to find the commission, then
+    constructs the full case_number from case_number_raw + case_prefix_text.
+
+    match_status tracks whether the linkage succeeded:
+      matched   — case_id is populated and reliable
+      unmatched — no matching case found; case_id is NULL
+      ambiguous — multiple commissions matched the court_name; first used
+
+    raw_payload stores the full original VOC record for debugging. When the
+    real API is integrated, replace _fetch_voc_data() in fetch_voc.py only.
+    """
+    __tablename__ = "voc_complaints"
+
+    id:               Mapped[int]            = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    voc_number:       Mapped[int]            = mapped_column(BigInteger, nullable=False, unique=True)
+    case_id:          Mapped[Optional[int]]  = mapped_column(
+        BigInteger, ForeignKey("cases.id", ondelete="SET NULL"), nullable=True
+    )
+    state_id:         Mapped[Optional[int]]  = mapped_column(Integer, nullable=True)
+    court_name:       Mapped[Optional[str]]  = mapped_column(String(255), nullable=True)
+    case_number_raw:  Mapped[Optional[str]]  = mapped_column(String(100), nullable=True)
+    match_status:     Mapped[VocMatchStatus] = mapped_column(
+        Enum(VocMatchStatus, name="voc_match_status_enum"),
+        nullable=False, default=VocMatchStatus.unmatched,
+    )
+    raw_payload:      Mapped[Optional[str]]  = mapped_column(Text, nullable=True)
+    created_at:       Mapped[datetime]       = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at:       Mapped[datetime]       = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    case: Mapped[Optional["Case"]] = relationship("Case", back_populates="voc_complaints")
+
+    __table_args__ = (
+        Index("idx_voc_case_id",      "case_id"),
+        Index("idx_voc_match_status", "match_status"),
+        Index("idx_voc_state_id",     "state_id"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<VocComplaint id={self.id} voc_number={self.voc_number} status={self.match_status} case_id={self.case_id}>"
