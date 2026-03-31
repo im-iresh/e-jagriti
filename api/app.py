@@ -96,12 +96,14 @@ def create_app(config_object: object | None = None) -> Flask:
     # ------------------------------------------------------------------
     # Blueprints
     # ------------------------------------------------------------------
+    from routes.batch       import batch_bp
     from routes.cases       import cases_bp
     from routes.commissions import commissions_bp
     from routes.judgments   import judgments_bp
     from routes.orders      import orders_bp
     from routes.stats       import stats_bp
 
+    app.register_blueprint(batch_bp)
     app.register_blueprint(cases_bp)
     app.register_blueprint(commissions_bp)
     app.register_blueprint(orders_bp)

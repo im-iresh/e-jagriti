@@ -23,7 +23,7 @@ from db.session import get_session
 
 # ORM models re-exported through api/models.py which resolves the ingestion
 # package path at import time (see that file for path logic).
-from models import Case, Commission, DailyOrder, IngestionRun  # noqa: E402
+from models import Case, Commission, DailyOrder, FailedJob, IngestionError, IngestionRun  # noqa: E402
 
 logger = structlog.get_logger(__name__)
 
@@ -440,6 +440,95 @@ def get_stats() -> dict[str, Any]:
         },
         "cases_per_month": monthly,
         "last_ingestion_run": last_run_data,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Batch Status
+# ---------------------------------------------------------------------------
+
+def get_batch_status(runs: int = 10) -> dict[str, Any]:
+    """
+    Return live ingestion pipeline status for developer debugging.
+
+    Queries:
+      - Most recent N IngestionRun rows with all counters
+      - Queue depths: cases needing detail fetch, PDFs pending, failed jobs
+      - Last 20 IngestionError rows (most recent first)
+
+    Args:
+        runs: Number of most-recent IngestionRun rows to include (max 50).
+
+    Returns:
+        Dict with ``recent_runs``, ``queue_depths``, and ``recent_errors``.
+    """
+    with get_session(read_only=True) as session:
+        run_rows = session.execute(
+            select(IngestionRun)
+            .order_by(IngestionRun.run_started_at.desc())
+            .limit(runs)
+        ).scalars().all()
+
+        cases_pending_detail: int = session.execute(
+            select(func.count(Case.id)).where(Case.last_fetched_at.is_(None))
+        ).scalar_one()
+
+        pdfs_pending: int = session.execute(
+            select(func.count(DailyOrder.id)).where(DailyOrder.pdf_fetched.is_(False))
+        ).scalar_one()
+
+        failed_jobs_pending: int = session.execute(
+            select(func.count(FailedJob.id)).where(FailedJob.resolved.is_(False))
+        ).scalar_one()
+
+        error_rows = session.execute(
+            select(IngestionError)
+            .order_by(IngestionError.created_at.desc())
+            .limit(20)
+        ).scalars().all()
+
+    recent_runs = [
+        {
+            "run_id":           r.id,
+            "started_at":       r.run_started_at.isoformat(),
+            "finished_at":      r.run_finished_at.isoformat() if r.run_finished_at else None,
+            "status":           "running" if r.run_finished_at is None else (
+                                    "failed" if r.fail_count > 0 else "completed"
+                                ),
+            "trigger_mode":     r.trigger_mode.value,
+            "total_calls":      r.total_calls,
+            "success_count":    r.success_count,
+            "fail_count":       r.fail_count,
+            "skip_count":       r.skip_count,
+            "duration_seconds": r.duration_seconds,
+            "notes":            r.notes,
+        }
+        for r in run_rows
+    ]
+
+    recent_errors = [
+        {
+            "id":            e.id,
+            "run_id":        e.run_id,
+            "case_id":       e.case_id,
+            "endpoint":      e.endpoint,
+            "http_status":   e.http_status,
+            "error_type":    e.error_type.value,
+            "error_message": e.error_message,
+            "retry_count":   e.retry_count,
+            "created_at":    e.created_at.isoformat(),
+        }
+        for e in error_rows
+    ]
+
+    return {
+        "recent_runs":  recent_runs,
+        "queue_depths": {
+            "cases_pending_detail_fetch": cases_pending_detail,
+            "pdfs_pending_fetch":         pdfs_pending,
+            "failed_jobs_unresolved":     failed_jobs_pending,
+        },
+        "recent_errors": recent_errors,
     }
 
 
