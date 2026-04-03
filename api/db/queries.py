@@ -12,18 +12,19 @@ when one is configured.
 from __future__ import annotations
 
 import json
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any
 
 import structlog
-from sqlalchemy import func, select, text
+from sqlalchemy import func, select, text, update as sa_update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import joinedload
 
 from db.session import get_session
 
 # ORM models re-exported through api/models.py which resolves the ingestion
 # package path at import time (see that file for path logic).
-from models import Case, Commission, DailyOrder, FailedJob, IngestionError, IngestionRun  # noqa: E402
+from models import Case, Commission, DailyOrder, FailedJob, IngestionError, IngestionRun, VocComplaint, VocMatchStatus  # noqa: E402
 
 logger = structlog.get_logger(__name__)
 
@@ -440,6 +441,149 @@ def get_stats() -> dict[str, Any]:
         },
         "cases_per_month": monthly,
         "last_ingestion_run": last_run_data,
+    }
+
+
+# ---------------------------------------------------------------------------
+# VOC attachment (write path — uses primary DB)
+# ---------------------------------------------------------------------------
+
+def attach_voc_to_case(case_id: int, voc_number: int, cms_payload: dict) -> dict[str, Any]:
+    """
+    Manually link a VOC complaint to a case.
+
+    Upserts the voc_complaints row (match_status=matched) and stamps
+    cases.voc_number so the no-VOC alert index stays accurate.
+
+    Uses get_session() without read_only so writes go to the primary DB.
+
+    Args:
+        case_id:     Internal surrogate id of the target case.
+        voc_number:  VOC complaint number from the CMS.
+        cms_payload: Full JSON response from the CMS (stored as raw_payload).
+
+    Returns:
+        Dict with ``case_id`` and ``voc_number``.
+
+    Raises:
+        LookupError:        case_id does not exist in the DB.
+        ValueError("conflict"): voc_number is already linked to a different case.
+    """
+    with get_session() as session:
+        # 1. Verify case exists
+        exists = session.execute(
+            select(Case.id).where(Case.id == case_id)
+        ).scalar_one_or_none()
+        if not exists:
+            raise LookupError(f"Case {case_id} not found")
+
+        # 2. Conflict check — VOC already linked to a different case?
+        linked_case_id = session.execute(
+            select(VocComplaint.case_id).where(VocComplaint.voc_number == voc_number)
+        ).scalar_one_or_none()
+        if linked_case_id is not None and linked_case_id != case_id:
+            raise ValueError("conflict")
+
+        # 3. Upsert voc_complaints row
+        stmt = (
+            pg_insert(VocComplaint)
+            .values(
+                voc_number=voc_number,
+                case_id=case_id,
+                match_status=VocMatchStatus.matched,
+                raw_payload=json.dumps(cms_payload),
+            )
+            .on_conflict_do_update(
+                index_elements=["voc_number"],
+                set_={
+                    "case_id":      pg_insert(VocComplaint).excluded.case_id,
+                    "match_status": pg_insert(VocComplaint).excluded.match_status,
+                    "raw_payload":  pg_insert(VocComplaint).excluded.raw_payload,
+                    "updated_at":   func.now(),
+                },
+            )
+        )
+        session.execute(stmt)
+
+        # 4. Stamp cases.voc_number so the partial index stays accurate
+        session.execute(
+            sa_update(Case).where(Case.id == case_id).values(voc_number=voc_number)
+        )
+
+    return {"case_id": case_id, "voc_number": voc_number}
+
+
+# ---------------------------------------------------------------------------
+# Alerts
+# ---------------------------------------------------------------------------
+
+def get_alert_cases() -> dict[str, Any]:
+    """
+    Return open/pending cases grouped by two alert conditions.
+
+    Sections:
+      no_voc       — cases where voc_number IS NULL (no VOC complaint linked).
+                     Uses the partial index idx_cases_no_voc; no join needed.
+      hearing_soon — cases where date_of_next_hearing falls within the next
+                     2 days (today through today + 2, inclusive).
+
+    Closed cases are excluded from both sections.
+
+    Returns:
+        Dict with ``no_voc`` and ``hearing_soon`` keys, each containing
+        ``count`` (int) and ``items`` (list of case dicts).
+    """
+    today = date.today()
+    cutoff = today + timedelta(days=2)
+
+    _cols = (
+        Case.id,
+        Case.case_number,
+        Case.complainant_name,
+        Case.case_stage_name,
+        Case.date_of_next_hearing,
+        Case.status,
+        Commission.name_en.label("commission_name"),
+        Commission.commission_type.label("commission_type"),
+    )
+    _base = (
+        select(*_cols)
+        .join(Commission, Case.commission_id == Commission.id)
+        .where(Case.status.in_(["open", "pending"]))
+    )
+
+    with get_session(read_only=True) as session:
+        no_voc_rows = session.execute(
+            _base.where(Case.voc_number.is_(None))
+            .order_by(Case.filing_date.desc().nullslast())
+        ).all()
+
+        hearing_rows = session.execute(
+            _base.where(Case.date_of_next_hearing.between(today, cutoff))
+            .order_by(Case.date_of_next_hearing.asc())
+        ).all()
+
+    def _serialize(r) -> dict[str, Any]:
+        return {
+            "case_id":              r.id,
+            "case_number":          r.case_number,
+            "complainant_name":     r.complainant_name,
+            "commission_name":      r.commission_name,
+            "commission_type":      r.commission_type,
+            "date_of_next_hearing": r.date_of_next_hearing.isoformat() if r.date_of_next_hearing else None,
+            "status":               r.status,
+            "case_stage":           r.case_stage_name,
+        }
+
+    return {
+        "no_voc": {
+            "count": len(no_voc_rows),
+            "items": [_serialize(r) for r in no_voc_rows],
+        },
+        "hearing_soon": {
+            "count": len(hearing_rows),
+            "items": [_serialize(r) for r in hearing_rows],
+        },
     }
 
 

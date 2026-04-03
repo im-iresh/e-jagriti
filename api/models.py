@@ -36,6 +36,7 @@ from db.models import (  # noqa: E402 — must come after sys.path update
     IngestionRun,
     JobType,
     TriggerMode,
+    VocComplaint,
 )
 
 __all__ = [
@@ -53,4 +54,5 @@ __all__ = [
     "IngestionRun",
     "JobType",
     "TriggerMode",
+    "VocComplaint",
 ]

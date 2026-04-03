@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from flask import Blueprint, request
 
+from auth import require_permission
 from db.queries import get_batch_status
 from schemas.responses import error_response, success_response
 
@@ -16,6 +17,7 @@ batch_bp = Blueprint("batch", __name__, url_prefix="/api/batch")
 
 
 @batch_bp.get("/status")
+@require_permission("batch:read")
 def batch_status():
     """
     Return live ingestion pipeline status.

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from flask import Blueprint, current_app
 
+from auth import require_permission
 from db.queries import get_all_commissions
 from schemas.responses import success_response
 
@@ -13,6 +14,7 @@ commissions_bp = Blueprint("commissions", __name__, url_prefix="/api")
 
 
 @commissions_bp.get("/commissions")
+@require_permission("commissions:read")
 def list_commissions():
     """
     Return the full list of commissions.

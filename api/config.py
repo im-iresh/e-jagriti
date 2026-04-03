@@ -51,6 +51,13 @@ class Config:
 
     # Logging
     LOG_LEVEL: str = os.environ.get("EJAGRITI_LOG_LEVEL", "INFO").upper()
+    LOG_DIR:   str = os.environ.get("EJAGRITI_LOG_DIR", "logs")
+
+    # SSO
+    SSO_URL: str = os.environ.get("EJAGRITI_SSO_URL", "https://sso.example.com")
+
+    # Complaint management system (CMS) — used by POST /api/cases/<id>/voc
+    CMS_BASE_URL: str = os.environ.get("EJAGRITI_CMS_BASE_URL", "")
 
 
 class TestingConfig(Config):

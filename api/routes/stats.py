@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from flask import Blueprint, jsonify
 
+from auth import require_permission
 from db.queries import get_health_data, get_stats
 from schemas.responses import success_response
 
@@ -13,6 +14,7 @@ stats_bp = Blueprint("stats", __name__)
 
 
 @stats_bp.get("/api/stats")
+@require_permission("stats:read")
 def aggregate_stats():
     """
     Return aggregate case statistics.

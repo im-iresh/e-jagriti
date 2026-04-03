@@ -8,6 +8,7 @@ from datetime import date
 
 from flask import Blueprint, request
 
+from auth import require_permission
 from db.queries import get_orders_for_case
 from schemas.responses import error_response, success_response
 
@@ -15,6 +16,7 @@ orders_bp = Blueprint("orders", __name__, url_prefix="/api/cases")
 
 
 @orders_bp.get("/<int:case_id>/orders")
+@require_permission("orders:read")
 def get_case_orders(case_id: int):
     """
     Return paginated daily orders for a case.

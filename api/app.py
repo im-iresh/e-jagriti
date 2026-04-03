@@ -21,24 +21,54 @@ from flask_caching import Cache
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 
+from cms_client import CMSClient
+
 # Module-level singletons so routes can import them directly.
-cache   = Cache()
-limiter = Limiter(key_func=get_remote_address)
+cache      = Cache()
+limiter    = Limiter(key_func=get_remote_address)
+cms_client = CMSClient()
 
 
-def _configure_logging(log_level: str = "INFO") -> None:
+def _configure_logging(log_level: str = "INFO", log_dir: str = "logs") -> None:
     """
-    Configure structlog for structured JSON output.
+    Configure structlog for structured JSON output to stdout and a daily
+    rotating log file.
+
+    Log files are written to log_dir and rotated at midnight UTC, keeping
+    30 days of history. Each file is named api.log (current) or
+    api.log.YYYY-MM-DD (rotated).
 
     Args:
         log_level: Logging level string (DEBUG, INFO, WARNING, ERROR).
+        log_dir: Directory for rotating log files (created if absent).
     """
+    from logging.handlers import TimedRotatingFileHandler
+    from pathlib import Path
+
     level = getattr(logging, log_level.upper(), logging.INFO)
-    logging.basicConfig(
-        format="%(message)s",
-        stream=sys.stdout,
-        level=level,
+    formatter = logging.Formatter("%(message)s")
+
+    stdout_handler = logging.StreamHandler(sys.stdout)
+    stdout_handler.setFormatter(formatter)
+
+    log_path = Path(log_dir)
+    log_path.mkdir(parents=True, exist_ok=True)
+    file_handler = TimedRotatingFileHandler(
+        filename=log_path / "api.log",
+        when="midnight",
+        interval=1,
+        backupCount=30,
+        encoding="utf-8",
+        utc=True,
     )
+    file_handler.suffix = "%Y-%m-%d"
+    file_handler.setFormatter(formatter)
+
+    root_logger = logging.getLogger()
+    root_logger.setLevel(level)
+    root_logger.addHandler(stdout_handler)
+    root_logger.addHandler(file_handler)
+
     structlog.configure(
         processors=[
             structlog.stdlib.filter_by_level,
@@ -75,7 +105,10 @@ def create_app(config_object: object | None = None) -> Flask:
     from config import get_config
     cfg = config_object or get_config()
 
-    _configure_logging(log_level=getattr(cfg, "LOG_LEVEL", "INFO"))
+    _configure_logging(
+        log_level=getattr(cfg, "LOG_LEVEL", "INFO"),
+        log_dir=getattr(cfg, "LOG_DIR", "logs"),
+    )
     log = structlog.get_logger(__name__)
 
     app = Flask(__name__)
@@ -86,6 +119,7 @@ def create_app(config_object: object | None = None) -> Flask:
     # ------------------------------------------------------------------
     cache.init_app(app)
     limiter.init_app(app)
+    cms_client.configure(base_url=getattr(cfg, "CMS_BASE_URL", ""))
 
     # ------------------------------------------------------------------
     # Middleware
@@ -114,6 +148,16 @@ def create_app(config_object: object | None = None) -> Flask:
     # Global error handlers
     # ------------------------------------------------------------------
     from schemas.responses import error_response
+
+    @app.errorhandler(401)
+    def unauthorized(_e):
+        """Return JSON 401 for unauthenticated requests."""
+        return error_response("UNAUTHORIZED", "Authentication required.", 401)
+
+    @app.errorhandler(403)
+    def forbidden(_e):
+        """Return JSON 403 for permission-denied requests."""
+        return error_response("FORBIDDEN", "You do not have permission to access this resource.", 403)
 
     @app.errorhandler(404)
     def not_found(_e):

@@ -410,7 +410,77 @@ curl "http://localhost:8000/api/cases?status=open&commission_type=district&searc
 
 ---
 
-### 6.2 `GET /api/cases/<case_id>` — Case detail
+### 6.2 `GET /api/cases/alerts` — Alert cases for notifications
+
+**Blueprint:** `cases_bp` (`routes/cases.py`)
+**Purpose:** Returns open/pending cases that need attention, grouped into two named alert sections. Designed for notification feeds and operator dashboards.
+
+**Auth:** `cases:read`
+**Caching:** Not cached — always returns live data.
+**Pagination:** None — returns all matching cases.
+
+**Example request:**
+
+```bash
+curl http://localhost:8000/api/cases/alerts
+```
+
+**Response shape:**
+
+```json
+{
+  "success": true,
+  "data": {
+    "no_voc": {
+      "count": 42,
+      "items": [
+        {
+          "case_id": 101,
+          "case_number": "DC/77/CC/104/2025",
+          "complainant_name": "Rajesh Kumar",
+          "commission_name": "District Consumer Disputes Redressal Commission, Agra",
+          "commission_type": "district",
+          "date_of_next_hearing": "2025-07-10",
+          "status": "open",
+          "case_stage": "ADMITTED"
+        }
+      ]
+    },
+    "hearing_soon": {
+      "count": 3,
+      "items": [
+        {
+          "case_id": 205,
+          "case_number": "SC/1/CC/22/2024",
+          "complainant_name": "Sunita Sharma",
+          "commission_name": "Delhi State Consumer Disputes Redressal Commission",
+          "commission_type": "state",
+          "date_of_next_hearing": "2025-04-05",
+          "status": "open",
+          "case_stage": "Arguments"
+        }
+      ]
+    }
+  }
+}
+```
+
+**Alert conditions:**
+
+| Section | Condition | Query |
+|---------|-----------|-------|
+| `no_voc` | Case has no linked VOC complaint | `cases.voc_number IS NULL` |
+| `hearing_soon` | Next hearing within 2 days (today through today+2, inclusive) | `date_of_next_hearing BETWEEN today AND today+2` |
+
+**Notes:**
+- Both sections only include `status = open` or `status = pending` cases. Closed cases are excluded.
+- `no_voc` items are ordered by `filing_date DESC`. `hearing_soon` items are ordered by `date_of_next_hearing ASC` (most imminent first).
+- A case can appear in both sections simultaneously if it has no VOC and also has an imminent hearing.
+- `no_voc` uses the partial index `idx_cases_no_voc` — no join against `voc_complaints` is performed. `cases.voc_number` is denormalised from `voc_complaints` and kept in sync by the `fetch_voc` ingestion job.
+
+---
+
+### 6.3 `GET /api/cases/<case_id>` — Case detail
 
 **Blueprint:** `cases_bp` (`routes/cases.py`)
 **Purpose:** Full nested case object including commission, all hearings in sequence order, and all daily order PDF records.
@@ -497,12 +567,62 @@ curl "http://localhost:8000/api/cases/42"
 - `hearings` are sorted by `hearing_sequence_number` ascending (chronological order).
 - `daily_orders` are sorted by `date_of_hearing` ascending.
 - `daily_order_available` is `true` when `daily_order_availability_status = 2` on the hearing row.
-- `proceeding_text` is a raw HTML blob (Word-generated markup). It can be very large; render it in a sandboxed iframe on the frontend.
+- `proceeding_text` is sanitized HTML — dangerous tags (`script`, `iframe`, `style`, etc.) and all attributes are stripped by the ingestion service using an `nh3` allowlist. Safe formatting tags (`p`, `b`, `br`, `table`, etc.) are preserved. You can render it directly in the frontend; sandboxing is still good practice for defence-in-depth.
 - Returns `404 NOT_FOUND` if the `case_id` does not exist.
 
 ---
 
-### 6.3 `GET /api/cases/<case_id>/orders` — Daily orders for a case
+### 6.4 `POST /api/cases/<case_id>/voc` — Attach a VOC complaint to a case
+
+**Blueprint:** `cases_bp` (`routes/cases.py`)
+**Purpose:** Manually link a VOC (Voice of Customer) complaint number to a case. Validates the VOC number against the complaint management system (CMS) and upserts the linkage in the DB.
+
+**Auth:** `cases:write`
+**Caching:** Not cached.
+
+**Request body (JSON):**
+```json
+{ "voc_number": 310256328 }
+```
+
+**Example request:**
+```bash
+curl -X POST http://localhost:8000/api/cases/101/voc \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <token>" \
+  -d '{"voc_number": 310256328}'
+```
+
+**Example response (201):**
+```json
+{
+  "success": true,
+  "data": {
+    "case_id": 101,
+    "voc_number": 310256328
+  }
+}
+```
+
+**Error responses:**
+
+| Code | Error code | Condition |
+|------|-----------|-----------|
+| 400 | `INVALID_PARAMS` | `voc_number` missing or not an integer |
+| 404 | `NOT_FOUND` | `case_id` does not exist |
+| 404 | `VOC_NOT_FOUND` | `voc_number` not found in the CMS |
+| 409 | `VOC_CONFLICT` | `voc_number` is already linked to a different case |
+| 502 | `CMS_UNAVAILABLE` | Could not reach the complaint management system |
+
+**Notes:**
+- The caller's SSO bearer token is forwarded to the CMS transparently — no separate CMS credential is needed.
+- On success, both `voc_complaints` (upserted, `match_status=matched`) and `cases.voc_number` are updated atomically, keeping the no-VOC alert index accurate.
+- The CMS endpoint path is configured in `api/cms_client.py` (`_VOC_PATH`). Update it when the real CMS route is confirmed.
+- Set `EJAGRITI_CMS_BASE_URL` in the environment to point to the complaint management system.
+
+---
+
+### 6.5 `GET /api/cases/<case_id>/orders` — Daily orders for a case
 
 **Blueprint:** `orders_bp` (`routes/orders.py`)
 **Purpose:** Paginated list of daily order PDF records for a single case, optionally filtered by date range.
@@ -563,7 +683,7 @@ curl "http://localhost:8000/api/cases/42/orders?from_date=2025-01-01&to_date=202
 
 ---
 
-### 6.4 `GET /api/cases/<case_id>/judgment` — Judgment for a case
+### 6.6 `GET /api/cases/<case_id>/judgment` — Judgment for a case
 
 **Blueprint:** `judgments_bp` (`routes/judgments.py`)
 **Purpose:** Returns the final judgment order (`order_type_id = 2`) for a case. Closed cases should have exactly one.
@@ -622,7 +742,7 @@ curl "http://localhost:8000/api/cases/42/judgment"
 
 ---
 
-### 6.5 `GET /api/commissions` — List all commissions
+### 6.7 `GET /api/commissions` — List all commissions
 
 **Blueprint:** `commissions_bp` (`routes/commissions.py`)
 **Purpose:** Returns the full list of all ~700+ consumer commissions in India (national, state, district). Cached for 1 hour.
@@ -672,7 +792,7 @@ curl "http://localhost:8000/api/commissions"
 
 ---
 
-### 6.6 `GET /api/stats` — Aggregate statistics
+### 6.8 `GET /api/stats` — Aggregate statistics
 
 **Blueprint:** `stats_bp` (`routes/stats.py`)
 **Purpose:** Dashboard-level aggregate counts and a 12-month filing time series. Cached for 1 hour.
@@ -725,7 +845,7 @@ curl "http://localhost:8000/api/stats"
 
 ---
 
-### 6.7 `GET /health` — Health check
+### 6.9 `GET /health` — Health check
 
 **Blueprint:** `stats_bp` (`routes/stats.py`)
 **Purpose:** Liveness probe. Returns DB connectivity status and a summary of the last ingestion run. Designed for load balancer health checks.
@@ -778,7 +898,7 @@ curl "http://localhost:8000/health"
 
 ---
 
-### 6.8 `GET /api/batch/status` — Ingestion pipeline status
+### 6.10 `GET /api/batch/status` — Ingestion pipeline status
 
 **Blueprint:** `batch_bp` (`routes/batch.py`)
 **Purpose:** Live snapshot of the ingestion pipeline state. Shows recent run history, current queue depths (work still to do), and the most recent error log entries. Designed for developer debugging and operator dashboards; can be wired into a frontend monitoring panel.

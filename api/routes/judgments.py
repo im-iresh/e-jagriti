@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from flask import Blueprint
 
+from auth import require_permission
 from db.queries import get_judgment_for_case
 from schemas.responses import error_response, success_response
 
@@ -13,6 +14,7 @@ judgments_bp = Blueprint("judgments", __name__, url_prefix="/api/cases")
 
 
 @judgments_bp.get("/<int:case_id>/judgment")
+@require_permission("orders:read")
 def get_case_judgment(case_id: int):
     """
     Return judgment details for a case.
