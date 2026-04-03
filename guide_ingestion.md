@@ -42,6 +42,7 @@ The e-Jagriti portal has no public API or bulk data export. This service reverse
 
 - Python 3.11+, `httpx` for HTTP, `SQLAlchemy 2.x` ORM, `Alembic` for migrations
 - `APScheduler` for cron scheduling, `structlog` for structured JSON logs
+- `nh3` (Rust-backed `ammonia` bindings) for HTML sanitization of proceeding text
 - PostgreSQL 15, optionally Redis (not yet used by ingestion)
 
 ---
@@ -160,6 +161,7 @@ One row per Samsung case across all commissions. Populated in two phases: first 
 | `complainant_name`, `respondent_name` | `varchar(500)` | Party names |
 | `complainant_advocate_names`, `respondent_advocate_names` | `text` | JSON array strings |
 | `status` | `enum` | Derived: `open`, `closed`, or `pending` |
+| `voc_number` | `bigint UNIQUE` | Denormalised from `voc_complaints.voc_number`; NULL = no VOC linked. Set by `fetch_voc` on match. |
 | `data_hash` | `varchar(32)` | MD5 of last `getCaseStatus` response; used to skip unchanged cases |
 | `last_fetched_at` | `timestamptz` | NULL = never fetched detail; used as priority queue signal |
 | `created_at`, `updated_at` | `timestamptz` | Auto-managed |
@@ -173,6 +175,7 @@ One row per Samsung case across all commissions. Populated in two phases: first 
 - `idx_cases_stage_name` on `case_stage_name`
 - `idx_cases_date_of_next_hearing` on `date_of_next_hearing`
 - `idx_cases_needs_detail_fetch` on `last_fetched_at` **WHERE** `last_fetched_at IS NULL` (partial index — only indexes the rows the detail job queries)
+- `idx_cases_no_voc` on `id` **WHERE** `voc_number IS NULL` (partial index — used by the alerts API `no_voc` query)
 
 ---
 
@@ -188,7 +191,7 @@ One row per entry in the `caseHearingDetails` array from `getCaseStatus`. Each c
 | `date_of_hearing` | `date` | When this hearing took place |
 | `date_of_next_hearing` | `date` | Next scheduled hearing |
 | `case_stage` | `varchar(255)` | Stage at time of this hearing |
-| `proceeding_text` | `text` | Raw HTML blob (Word-generated markup); stored compressed via Postgres TOAST |
+| `proceeding_text` | `text` | Sanitized HTML from the API (dangerous tags/attributes stripped via `nh3` allowlist; safe formatting preserved); stored compressed via Postgres TOAST |
 | `daily_order_status` | `boolean` | Whether an order was issued |
 | `order_type_id` | `integer` | Type of order |
 | `daily_order_availability_status` | `integer` | `NULL`=N/A, `1`=not yet available, **`2`=PDF available** (triggers fetch) |
@@ -446,7 +449,94 @@ with EJagritiClient(base_url=...) as client:
 
 ---
 
-## 5. Operating Modes
+## 5. CMS Client & Token Manager
+
+**File:** `ingestion/services/` package
+
+### Overview
+
+The complaint management system (CMS) requires bearer-token authentication. The ingestion service uses a dedicated service account — it does **not** forward end-user tokens (that is the API service's pattern). Two modules in `ingestion/services/` handle this:
+
+| Module | Responsibility |
+|--------|---------------|
+| `cms_token_manager.py` | Obtains + caches the service-account token; refreshes on expiry |
+| `cms_client.py` | Makes authenticated HTTP calls to the CMS; delegates all auth to the manager |
+
+### Token Manager — `CMSTokenManager`
+
+A thread-safe **double-checked locking singleton**. The process holds exactly one instance and one cached token.
+
+**Getting a token:**
+```python
+from services.cms_token_manager import CMSTokenManager
+
+token = CMSTokenManager.get_instance().get_token()
+# First call → POST to SSO login endpoint, caches the token
+# Subsequent calls → returns cached value, no HTTP call
+```
+
+**Refresh on expiry:**
+```python
+# Called automatically by CMSIngestionClient on 401 / 404
+token = CMSTokenManager.get_instance().refresh()
+```
+
+**SSO login flow** (`_fetch()` internals):
+```
+POST EJAGRITI_CMS_SSO_URL
+Content-Type: application/json
+{ "username": "...", "password": "..." }
+
+→ { "token": "<jwt>" }          (or "access_token" — both keys checked)
+```
+
+**Thread-safety guarantees:**
+
+| Scenario | Behaviour |
+|----------|-----------|
+| Two threads on cold cache | `_token_lock` serialises; only the first hits SSO, the second reuses the result |
+| Two threads receive 401 simultaneously | `_token_lock` in `refresh()` serialises; only one SSO call is made |
+
+### CMS Client — `CMSIngestionClient`
+
+```python
+from services.cms_client import CMSIngestionClient
+
+client = CMSIngestionClient()   # reads EJAGRITI_CMS_BASE_URL from env
+records = client.get_voc_list()
+```
+
+**Retry logic on token expiry:**
+1. Make request with current cached token
+2. If response status is `401` or `404` → call `CMSTokenManager.refresh()` → retry once
+3. If second attempt also fails → `raise_for_status()` propagates the error
+
+### Environment variables
+
+| Variable | Required | Purpose |
+|----------|----------|---------|
+| `EJAGRITI_CMS_BASE_URL` | Yes | CMS root URL |
+| `EJAGRITI_CMS_SSO_URL` | Yes | SSO login endpoint (POST) |
+| `EJAGRITI_CMS_USERNAME` | Yes | Service account username |
+| `EJAGRITI_CMS_PASSWORD` | Yes | Service account password |
+
+### Hooking into `fetch_voc`
+
+`_fetch_voc_data()` in `ingestion/jobs/fetch_voc.py` currently returns dummy data. When the real CMS endpoint is confirmed, replace its body:
+
+```python
+from services.cms_client import CMSIngestionClient
+
+def _fetch_voc_data() -> list[dict]:
+    client = CMSIngestionClient()
+    return client.get_voc_list()   # update _VOC_LIST_PATH in cms_client.py first
+```
+
+No other changes to `fetch_voc.py` are needed — the token management is fully encapsulated.
+
+---
+
+## 6. Operating Modes
 
 The service has two main modes and one modifier flag, controlled entirely by environment variables.
 
@@ -492,7 +582,7 @@ Use for: smoke-testing API connectivity, verifying the service can reach e-Jagri
 
 ---
 
-## 6. Scheduling
+## 7. Scheduling
 
 **File:** `ingestion/scheduler.py`
 
@@ -542,7 +632,7 @@ This means a single job crashing never affects other scheduled jobs.
 
 ---
 
-## 7. Environment Variables
+## 8. Environment Variables
 
 All variables are loaded from `ingestion/.env` via `python-dotenv` at startup.
 
@@ -581,7 +671,7 @@ All variables are loaded from `ingestion/.env` via `python-dotenv` at startup.
 
 ---
 
-## 8. Logging
+## 9. Logging
 
 **File:** `ingestion/main.py` — `_configure_logging()`
 
@@ -637,7 +727,7 @@ These loggers are forced to `WARNING` level regardless of `EJAGRITI_LOG_LEVEL`:
 
 ---
 
-## 9. Jobs Reference
+## 10. Jobs Reference
 
 Each job is a Python module under `ingestion/jobs/`. Every job exposes a single `run()` function with this signature:
 
@@ -1051,7 +1141,7 @@ Fields written to `hearings`:
 | `date_of_hearing` | `dateOfHearing` |
 | `date_of_next_hearing` | `dateOfNextHearing` |
 | `case_stage` | `caseStage` |
-| `proceeding_text` | `proceedingText` (raw HTML blob) |
+| `proceeding_text` | `proceedingText` (sanitized via `_sanitize_html()` — `nh3` allowlist) |
 | `daily_order_status` | `dailyOrderStatus` |
 | `order_type_id` | `orderTypeId` |
 | `daily_order_availability_status` | `dailyOrderAvailabilityStatus` |
@@ -1484,7 +1574,7 @@ No changes needed to matching logic, upsert, scheduler, migration, or any other 
 
 ---
 
-## 10. Full Data Flow
+## 11. Full Data Flow
 
 The following diagram shows how data moves through the pipeline from first API call to stored PDF:
 
@@ -1829,3 +1919,116 @@ EJAGRITI_DRY_RUN=true docker-compose up ingestion
 ```
 
 Or set variables in a `.env` file at the project root (Docker Compose reads it automatically).
+
+---
+
+## 14. Adding a New Job
+
+Follow these steps exactly to integrate a new ingestion job into the pipeline.
+
+### Step 1 — Add a `job_type_enum` value (if needed)
+
+If your job represents a new kind of work not covered by the existing enum values (`fetch_commissions`, `fetch_cases`, `fetch_case_detail`, `fetch_daily_order`), add a new value via an Alembic migration:
+
+```python
+# migrations/versions/0002_add_job_type.py
+def upgrade() -> None:
+    op.execute("ALTER TYPE job_type_enum ADD VALUE 'fetch_your_thing'")
+```
+
+Then add the corresponding value to the `JobType` enum in `ingestion/db/models.py`:
+
+```python
+class JobType(str, enum.Enum):
+    ...
+    fetch_your_thing = "fetch_your_thing"
+```
+
+If your job fits an existing `job_type`, skip this step.
+
+### Step 2 — Write the job module
+
+Create `ingestion/jobs/fetch_your_thing.py`. Every job module must expose a `run()` function with this exact signature:
+
+```python
+def run(
+    client: EJagritiClient,
+    run_id: int,
+    dry_run: bool = False,
+    daily_budget: int = 3500,
+) -> dict[str, int]:
+    stats = {"fetched": 0, "upserted": 0, "failed": 0, "skipped": 0}
+    ...
+    return stats
+```
+
+**Error handling rules inside `run()`:**
+
+| Situation | What to call | Why |
+|-----------|-------------|-----|
+| 403 Forbidden | `log_failed_job(job_type=..., endpoint=..., reason=...)` | Permanent denial — worth retrying later |
+| Retryable HTTP error (after client exhausts retries) | `log_ingestion_error(run_id=run_id, error_type=ErrorType.http_error, ...)` | Transient; logged for audit |
+| Parse error | `log_ingestion_error(..., error_type=ErrorType.parse_error, ...)` | Transient |
+| DB write error | `log_ingestion_error(..., error_type=ErrorType.db_error, ...)` | Transient |
+
+Always catch errors **per-item** and `continue` — never let one failure abort the whole batch.
+
+Rate-limit your calls with `time.sleep(calculate_interval(daily_budget))` before each HTTP call.
+
+### Step 3 — Export from `jobs/__init__.py`
+
+```python
+# ingestion/jobs/__init__.py
+from . import fetch_your_thing
+```
+
+### Step 4 — Register in `scheduler.py`
+
+Add a scheduler callback and wire it into both `create_scheduler()` and `run_once_batch()`:
+
+```python
+# 1. Import at the top
+from jobs import ..., fetch_your_thing
+
+# 2. Add a callback function
+def _job_fetch_your_thing() -> None:
+    dry_run = os.environ.get("EJAGRITI_DRY_RUN", "false").lower() == "true"
+    _run_job(fetch_your_thing.run, trigger_mode=TriggerMode.scheduler, dry_run=dry_run)
+
+# 3. Register in create_scheduler()
+scheduler.add_job(
+    _job_fetch_your_thing,
+    trigger="cron", hour=<UTC_HOUR>, minute=0,
+    id="fetch_your_thing", replace_existing=True,
+    misfire_grace_time=3600,
+)
+
+# 4. Add to run_once_batch() steps list (in dependency order)
+steps = [
+    fetch_commissions.run,
+    fetch_cases.run,
+    fetch_voc.run,
+    fetch_case_detail.run,
+    fetch_orders.run,
+    fetch_judgments.run,
+    fetch_your_thing.run,   # ← add here at the right position
+]
+```
+
+`_run_job()` handles `ingestion_runs` (create + close with counts/duration) automatically — you do not need to call those helpers inside the job itself.
+
+### What you do NOT need to do
+
+- Call `create_ingestion_run()` / `close_ingestion_run()` — `_run_job()` handles this.
+- Commit sessions — `get_session()` is a context manager that commits on exit.
+- Handle `dry_run` globally — check `if not dry_run:` around DB writes inside your job.
+
+### Checklist
+
+- [ ] `job_type_enum` value exists in DB and in `JobType` enum (or reuses existing)
+- [ ] `run()` returns a dict with at least `fetched`, `upserted`, `failed` keys
+- [ ] Every HTTP call is preceded by `time.sleep(calculate_interval(daily_budget))`
+- [ ] 403 → `log_failed_job`, all other errors → `log_ingestion_error`
+- [ ] `dry_run` guard around all DB writes
+- [ ] Exported from `jobs/__init__.py`
+- [ ] Callback added to `scheduler.py`, registered in `create_scheduler()` and `run_once_batch()`

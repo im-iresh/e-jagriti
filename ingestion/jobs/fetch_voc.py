@@ -20,7 +20,7 @@ import json
 from typing import Any
 
 import structlog
-from sqlalchemy import select
+from sqlalchemy import select, update as sa_update
 
 from client import EJagritiClient
 from db.models import Case, Commission, VocMatchStatus
@@ -230,6 +230,12 @@ def run(
         try:
             with get_session() as session:
                 upsert_voc_complaint(session, voc_data)
+                if case_id is not None:
+                    session.execute(
+                        sa_update(Case)
+                        .where(Case.id == case_id)
+                        .values(voc_number=voc_number)
+                    )
             stats["upserted"] += 1
         except Exception as exc:
             log.error("voc_upsert_failed", voc_number=voc_number, error=str(exc))

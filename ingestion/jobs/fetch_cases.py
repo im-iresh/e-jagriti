@@ -11,17 +11,16 @@ Returns lightweight case-list rows. Upserts into `cases` with list-level
 fields only; filing_reference_number is NOT available here — it is set
 later by fetch_case_detail.
 
-The date window defaults to [2015-01-01, today] to catch all historical
-cases on the first run. Subsequent runs use [last_run_date, today] to
-avoid re-scanning the full history every day (controlled via env var
-FETCH_CASES_FROM_DATE or defaults to full scan).
+The date window defaults to [yesterday, today] so each daily run only
+scans the previous day's filings. Override via EJAGRITI_FETCH_CASES_FROM_DATE
+(e.g. set to 2015-01-01 for a one-off historical backfill).
 """
 
 from __future__ import annotations
 
 import os
 import time
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import structlog
@@ -35,7 +34,6 @@ from db.upsert import log_failed_job, log_ingestion_error, upsert_case
 logger = structlog.get_logger(__name__)
 
 _PATH = "/report/report/getCauseTitleListByCompany"
-_DEFAULT_FROM_DATE = "2015-01-01"
 _SEARCH_KEYWORD = os.environ.get("EJAGRITI_SEARCH_KEYWORD", "samsung")
 
 _TYPE_ID_MAP: dict[CommissionType, int] = {
@@ -119,7 +117,10 @@ def run(
     stats = {"fetched": 0, "upserted": 0, "failed": 0}
     log = logger.bind(job="fetch_cases", run_id=run_id, dry_run=dry_run)
 
-    from_date = os.environ.get("EJAGRITI_FETCH_CASES_FROM_DATE", _DEFAULT_FROM_DATE)
+    from_date = os.environ.get(
+        "EJAGRITI_FETCH_CASES_FROM_DATE",
+        (date.today() - timedelta(days=1)).isoformat(),
+    )
     to_date = date.today().isoformat()
 
     commissions = _get_all_commissions()

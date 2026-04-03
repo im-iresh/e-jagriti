@@ -1,8 +1,7 @@
 """
 Job: fetch_case_detail
 
-For cases where last_fetched_at IS NULL (never fetched) or where the
-data has changed (detected via MD5 hash), calls:
+For every open or pending case, calls:
   GET /case/caseFilingService/v2/getCaseStatus?caseNumber=DC%2F77%2FCC%2F104%2F2025
 
 Parses the full nested response:
@@ -10,6 +9,10 @@ Parses the full nested response:
   - Upserts all caseHearingDetails[] → hearings rows
   - For hearings with daily_order_availability_status=2, creates daily_orders
     stub rows (pdf_fetched=False) so fetch_orders can pick them up
+
+Cases are processed in id-order chunks of _CHUNK_SIZE so the full case list
+is never loaded into memory at once. Every open/pending case is refreshed on
+each daily run.
 
 Key quirk: fillingReferenceNumber (double-l typo) in the API response.
 """
@@ -38,7 +41,43 @@ from db.upsert import (
 logger = structlog.get_logger(__name__)
 
 _PATH = "/case/caseFilingService/v2/getCaseStatus"
-_BATCH_SIZE = 50  # Cases fetched per scheduler invocation
+_CHUNK_SIZE = 500  # cases fetched from DB per chunk — tune independently of budget
+
+
+# ---------------------------------------------------------------------------
+# HTML sanitization
+# ---------------------------------------------------------------------------
+
+import nh3
+
+_ALLOWED_TAGS: frozenset[str] = frozenset({
+    # Headings
+    "h1", "h2", "h3", "h4", "h5", "h6",
+    # Text formatting
+    "p", "br", "b", "i", "u", "strong", "em", "s", "sub", "sup",
+    # Lists
+    "ul", "ol", "li", "dl", "dt", "dd",
+    # Tables
+    "table", "thead", "tbody", "tfoot", "tr", "th", "td", "caption",
+    # Block / inline containers
+    "span", "div", "blockquote", "pre", "code",
+    # Misc document structure
+    "hr", "section", "article",
+})
+
+
+def _sanitize_html(text: str | None) -> str | None:
+    """
+    Sanitize HTML from the API using an allowlist of safe formatting tags.
+
+    Strips all dangerous tags (script, iframe, style, etc.) and all attributes
+    (class, style, onclick, etc.). Safe formatting tags are preserved as-is.
+    Returns None if input is None or empty.
+    """
+    if not text:
+        return text
+    cleaned = nh3.clean(text, tags=_ALLOWED_TAGS, attributes={})
+    return cleaned or None
 
 
 def _md5(payload: Any) -> str:
@@ -95,31 +134,7 @@ def _map_status(stage_name: str | None) -> str:
     return "pending"
 
 
-def _get_cases_needing_detail(limit: int) -> list[dict[str, Any]]:
-    """
-    Return up to ``limit`` cases that need a detail fetch.
-
-    Priority order:
-      1. Cases where last_fetched_at IS NULL (never fetched)
-      2. Cases not fetched in the last 24 h (stale)
-
-    Args:
-        limit: Maximum rows to return.
-
-    Returns:
-        List of dicts with keys: id, case_number.
-    """
-    with get_session(read_only=True) as session:
-        rows = session.execute(
-            select(Case.id, Case.case_number)
-            .where(Case.last_fetched_at.is_(None))
-            .limit(limit)
-        ).all()
-    return [{"id": r.id, "case_number": r.case_number} for r in rows]
-
-
 def _process_detail(
-    session_factory: Any,
     case_db_id: int,
     case_number: str,
     data: dict[str, Any],
@@ -130,10 +145,10 @@ def _process_detail(
     """
     Parse and persist the getCaseStatus response for one case.
 
-    Computes the data hash and skips DB writes if unchanged.
+    Always stamps last_fetched_at regardless of whether the data changed.
+    Skips all other DB writes when the hash is unchanged (data not modified).
 
     Args:
-        session_factory: Callable that returns a get_session context manager.
         case_db_id: Internal DB id of the case.
         case_number: Case number string (for logging).
         data: Parsed ``data`` block from the getCaseStatus response.
@@ -146,8 +161,24 @@ def _process_detail(
     """
     log = logger.bind(case_number=case_number, case_db_id=case_db_id)
     new_hash = _md5(data)
+    now = datetime.now(timezone.utc)
 
+    if dry_run:
+        log.debug("dry_run_skip_detail")
+        return "skipped"
+
+    # Always stamp last_fetched_at — even if data is unchanged — so monitoring
+    # queries (e.g. "cases not refreshed in 48h") stay accurate.
     if existing_hash and existing_hash == new_hash:
+        try:
+            with get_session() as session:
+                session.execute(
+                    sa_update(Case)
+                    .where(Case.case_number == case_number)
+                    .values(last_fetched_at=now)
+                )
+        except Exception as exc:
+            log.error("touch_last_fetched_at_failed", error=str(exc))
         log.debug("case_detail_unchanged")
         return "skipped"
 
@@ -169,22 +200,17 @@ def _process_detail(
         "respondent_advocate_names":  json.dumps(data.get("respondentAdvocate") or []),
         "status":                     _map_status(data.get("caseStage")),
         "data_hash":                  new_hash,
-        "last_fetched_at":            datetime.now(timezone.utc),
-        # commission_id must already exist — do not overwrite with None
+        "last_fetched_at":            now,
     }
-    # Remove None commission_id so ON CONFLICT DO UPDATE doesn't clear it
+    # Remove None values but preserve explicit None for date_of_next_hearing
     case_update = {k: v for k, v in case_update.items() if v is not None or k in ("date_of_next_hearing",)}
 
     hearings: list[dict] = data.get("caseHearingDetails") or []
 
-    if dry_run:
-        log.debug("dry_run_skip_detail", hearings=len(hearings))
-        return "skipped"
-
     try:
         with get_session() as session:
-            # Case already exists in DB (we queried it to get here) — UPDATE only,
-            # never INSERT, so commission_id (not in case_update) is preserved.
+            # Case already exists in DB — UPDATE only, never INSERT,
+            # so commission_id (not in case_update) is preserved.
             session.execute(
                 sa_update(Case).where(Case.case_number == case_number).values(**case_update)
             )
@@ -200,7 +226,7 @@ def _process_detail(
                     "date_of_hearing":                 _parse_date(h.get("dateOfHearing")),
                     "date_of_next_hearing":            _parse_date(h.get("dateOfNextHearing")),
                     "case_stage":                      h.get("caseStage"),
-                    "proceeding_text":                 h.get("proceedingText"),
+                    "proceeding_text":                 _sanitize_html(h.get("proceedingText")),
                     "daily_order_status":              h.get("dailyOrderStatus"),
                     "order_type_id":                   h.get("orderTypeId"),
                     "daily_order_availability_status": h.get("dailyOrderAvailabilityStatus"),
@@ -245,17 +271,18 @@ def run(
     run_id: int,
     dry_run: bool = False,
     daily_budget: int = 3500,
-    batch_size: int = _BATCH_SIZE,
 ) -> dict[str, int]:
     """
-    Execute the fetch_case_detail job for cases needing a detail refresh.
+    Execute the fetch_case_detail job for all open and pending cases.
+
+    Cases are queried in id-order chunks of _CHUNK_SIZE to keep memory usage
+    bounded. All open/pending cases are covered in a single daily run.
 
     Args:
         client: Authenticated eJagriti HTTP client.
         run_id: Current IngestionRun.id.
         dry_run: Skip DB writes when True.
         daily_budget: Daily call budget for interval calculation.
-        batch_size: Maximum cases to process per run.
 
     Returns:
         Dict with ``fetched``, ``updated``, ``skipped``, ``failed`` counts.
@@ -263,70 +290,78 @@ def run(
     stats = {"fetched": 0, "updated": 0, "skipped": 0, "failed": 0}
     log = logger.bind(job="fetch_case_detail", run_id=run_id, dry_run=dry_run)
 
-    # Load current hashes in one query to avoid N+1 hash reads
-    with get_session(read_only=True) as session:
-        from sqlalchemy import select as sa_select
-        hash_rows = session.execute(
-            sa_select(Case.id, Case.case_number, Case.data_hash, Case.filing_reference_number)
-            .where(Case.last_fetched_at.is_(None))
-            .limit(batch_size)
-        ).all()
+    last_id = 0
+    chunk_num = 0
 
-    if not hash_rows:
-        log.info("no_cases_needing_detail")
-        return stats
-
-    log.info("detail_batch_start", count=len(hash_rows))
-
-    for row in hash_rows:
-        time.sleep(calculate_interval(daily_budget))
-        encoded = row.case_number.replace("/", "%2F")
-
-        try:
-            resp = client.get(_PATH, params={"caseNumber": row.case_number})
-            stats["fetched"] += 1
-        except PermissionError as exc:
-            log.error("detail_forbidden", case_number=row.case_number)
-            with get_session() as session:
-                log_failed_job(
-                    session,
-                    job_type=JobType.fetch_case_detail,
-                    endpoint=_PATH,
-                    reason=str(exc),
-                    case_id=row.id,
-                    params={"caseNumber": row.case_number},
+    while True:
+        # Fetch next chunk of open/pending cases ordered by id (stable cursor)
+        with get_session(read_only=True) as session:
+            rows = session.execute(
+                select(Case.id, Case.case_number, Case.data_hash, Case.filing_reference_number)
+                .where(
+                    Case.status.in_(["open", "pending"]),
+                    Case.id > last_id,
                 )
-            stats["failed"] += 1
-            continue
-        except Exception as exc:
-            log.error("detail_fetch_error", case_number=row.case_number, error=str(exc))
-            with get_session() as session:
-                log_ingestion_error(
-                    session,
-                    run_id=run_id,
-                    case_id=row.id,
-                    endpoint=_PATH,
-                    error_type=ErrorType.http_error,
-                    error_message=str(exc),
-                )
-            stats["failed"] += 1
-            continue
+                .order_by(Case.id.asc())
+                .limit(_CHUNK_SIZE)
+            ).all()
 
-        if resp.get("status") != 200 or not resp.get("data"):
-            log.warning("detail_empty_response", case_number=row.case_number)
-            stats["failed"] += 1
-            continue
+        if not rows:
+            break
 
-        result = _process_detail(
-            session_factory=get_session,
-            case_db_id=row.id,
-            case_number=row.case_number,
-            data=resp["data"],
-            existing_hash=row.data_hash,
-            run_id=run_id,
-            dry_run=dry_run,
-        )
-        stats[result] = stats.get(result, 0) + 1
+        chunk_num += 1
+        log.info("detail_chunk_start", chunk=chunk_num, count=len(rows), from_id=last_id + 1)
 
-    log.info("fetch_case_detail_complete", **stats)
+        for row in rows:
+            time.sleep(calculate_interval(daily_budget))
+
+            try:
+                resp = client.get(_PATH, params={"caseNumber": row.case_number})
+                stats["fetched"] += 1
+            except PermissionError as exc:
+                log.error("detail_forbidden", case_number=row.case_number)
+                with get_session() as session:
+                    log_failed_job(
+                        session,
+                        job_type=JobType.fetch_case_detail,
+                        endpoint=_PATH,
+                        reason=str(exc),
+                        case_id=row.id,
+                        params={"caseNumber": row.case_number},
+                    )
+                stats["failed"] += 1
+                continue
+            except Exception as exc:
+                log.error("detail_fetch_error", case_number=row.case_number, error=str(exc))
+                with get_session() as session:
+                    log_ingestion_error(
+                        session,
+                        run_id=run_id,
+                        case_id=row.id,
+                        endpoint=_PATH,
+                        error_type=ErrorType.http_error,
+                        error_message=str(exc),
+                    )
+                stats["failed"] += 1
+                continue
+
+            if resp.get("status") != 200 or not resp.get("data"):
+                log.warning("detail_empty_response", case_number=row.case_number)
+                stats["failed"] += 1
+                continue
+
+            result = _process_detail(
+                case_db_id=row.id,
+                case_number=row.case_number,
+                data=resp["data"],
+                existing_hash=row.data_hash,
+                run_id=run_id,
+                dry_run=dry_run,
+            )
+            stats[result] = stats.get(result, 0) + 1
+
+        last_id = rows[-1].id
+        log.info("detail_chunk_done", chunk=chunk_num, last_id=last_id, **stats)
+
+    log.info("fetch_case_detail_complete", chunks=chunk_num, **stats)
     return stats

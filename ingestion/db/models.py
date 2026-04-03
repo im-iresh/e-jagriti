@@ -24,7 +24,7 @@ from typing import Optional
 from sqlalchemy import (
     BigInteger, Boolean, Date, DateTime, Enum, Float,
     ForeignKey, Index, Integer, String, Text,
-    UniqueConstraint, func,
+    UniqueConstraint, func, text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -167,6 +167,9 @@ class Case(Base):
         Enum(CaseStatus, name="case_status_enum"),
         nullable=False, default=CaseStatus.pending, server_default=CaseStatus.pending.value
     )
+    # Denormalised from voc_complaints.voc_number for fast no-VOC alert queries.
+    # NULL = no VOC complaint linked. Set by fetch_voc when a match is found.
+    voc_number: Mapped[Optional[int]]            = mapped_column(BigInteger, nullable=True, unique=True)
     data_hash: Mapped[Optional[str]]             = mapped_column(String(32), nullable=True)
     last_fetched_at: Mapped[Optional[datetime]]  = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime]                 = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
@@ -185,6 +188,8 @@ class Case(Base):
         Index("idx_cases_date_of_next_hearing", "date_of_next_hearing"),
         Index("idx_cases_needs_detail_fetch",   "last_fetched_at",
               postgresql_where="last_fetched_at IS NULL"),
+        Index("idx_cases_no_voc",               "id",
+              postgresql_where=text("voc_number IS NULL")),
     )
 
     def __repr__(self) -> str:
