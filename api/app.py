@@ -18,15 +18,16 @@ import sys
 import structlog
 from flask import Flask
 from flask_caching import Cache
+from flask_cors import CORS
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
-
-from cms_client import CMSClient
+from flask_smorest import Api
 
 # Module-level singletons so routes can import them directly.
-cache      = Cache()
-limiter    = Limiter(key_func=get_remote_address)
-cms_client = CMSClient()
+cache    = Cache()
+cors     = CORS()
+limiter  = Limiter(key_func=get_remote_address)
+api_docs = Api()
 
 
 def _configure_logging(log_level: str = "INFO", log_dir: str = "logs") -> None:
@@ -119,7 +120,20 @@ def create_app(config_object: object | None = None) -> Flask:
     # ------------------------------------------------------------------
     cache.init_app(app)
     limiter.init_app(app)
-    cms_client.configure(base_url=getattr(cfg, "CMS_BASE_URL", ""))
+    cors.init_app(
+        app,
+        origins=cfg.CORS_ORIGINS,
+        allow_headers=["Authorization", "Content-Type", "X-Request-ID"],
+        expose_headers=["X-Request-ID"],
+        max_age=cfg.CORS_MAX_AGE,
+        methods=["GET", "OPTIONS"],
+    )
+    api_docs.init_app(app)
+    api_docs.spec.components.security_scheme(
+        "BearerAuth",
+        {"type": "http", "scheme": "bearer"},
+    )
+    api_docs.spec.options["security"] = [{"BearerAuth": []}]
 
     # ------------------------------------------------------------------
     # Middleware
@@ -130,19 +144,15 @@ def create_app(config_object: object | None = None) -> Flask:
     # ------------------------------------------------------------------
     # Blueprints
     # ------------------------------------------------------------------
-    from routes.batch       import batch_bp
-    from routes.cases       import cases_bp
-    from routes.commissions import commissions_bp
-    from routes.judgments   import judgments_bp
-    from routes.orders      import orders_bp
-    from routes.stats       import stats_bp
+    from routes.batch  import batch_bp
+    from routes.cases  import cases_bp
+    from routes.orders import orders_bp
+    from routes.stats  import stats_bp
 
-    app.register_blueprint(batch_bp)
-    app.register_blueprint(cases_bp)
-    app.register_blueprint(commissions_bp)
-    app.register_blueprint(orders_bp)
-    app.register_blueprint(judgments_bp)
-    app.register_blueprint(stats_bp)
+    api_docs.register_blueprint(batch_bp)
+    api_docs.register_blueprint(cases_bp)
+    api_docs.register_blueprint(orders_bp)
+    api_docs.register_blueprint(stats_bp)
 
     # ------------------------------------------------------------------
     # Global error handlers

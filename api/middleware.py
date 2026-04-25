@@ -15,14 +15,21 @@ import uuid
 
 import httpx
 import structlog
-from flask import Flask, current_app, g, request
+from flask import Flask, current_app, g, make_response, request
 
 from schemas.responses import error_response
 
 logger = structlog.get_logger(__name__)
 
 # Paths that bypass the /api/* authentication gate entirely.
-_PUBLIC_PATHS: frozenset[str] = frozenset({"/health"})
+# The Swagger UI and its spec are public so developers can open the page in a
+# browser; actual API endpoints are still protected by the auth gate below.
+_PUBLIC_PATHS: frozenset[str] = frozenset({
+    "/health",
+    "/api/docs",
+    "/api/openapi.json",
+    "/api/docs/oauth2-redirect",   # Swagger UI OAuth redirect helper
+})
 
 
 def register_middleware(app: Flask) -> None:
@@ -62,29 +69,41 @@ def register_middleware(app: Flask) -> None:
         g.user_info = None
         auth_header = request.headers.get("Authorization", "")
         if not auth_header.startswith("Bearer "):
+            # No token — let _enforce_api_auth handle the 401.
             return
 
         token = auth_header[7:]
         sso_url = current_app.config.get("SSO_URL", "")
         if not sso_url:
-            return
+            logger.error("sso_url_not_configured", request_path=request.path)
+            return error_response("CONFIGURATION_ERROR", "SSO service is not configured.", 500)
 
         try:
             resp = httpx.get(
-                f"{sso_url}/api/v1/userinfo",
+                f"{sso_url}/api/v1/sso/userInfo",
                 headers={"Authorization": f"Bearer {token}"},
                 timeout=5.0,
             )
-            if resp.status_code == 200:
-                g.user_info = resp.json()
-            else:
-                logger.warning(
-                    "sso_non_200",
-                    status=resp.status_code,
-                    request_path=request.path,
-                )
+        except (httpx.ConnectError, httpx.TimeoutException) as exc:
+            logger.warning("sso_unreachable", error=str(exc), request_path=request.path)
+            return error_response("SSO_UNAVAILABLE", "Could not connect to SSO service.", 503)
         except Exception as exc:
             logger.warning("sso_call_failed", error=str(exc), request_path=request.path)
+            return error_response("SSO_UNAVAILABLE", "Could not connect to SSO service.", 503)
+
+        if resp.status_code != 200:
+            logger.warning("sso_non_200", status=resp.status_code, request_path=request.path)
+            proxied = make_response(resp.content, resp.status_code)
+            proxied.headers["Content-Type"] = resp.headers.get("Content-Type", "application/json")
+            return proxied
+
+        body = resp.json()
+        rsp  = body.get("rsp") if isinstance(body, dict) else None
+        data = rsp.get("data") if isinstance(rsp, dict) else None
+        if data is None:
+            logger.warning("sso_unexpected_shape", request_path=request.path)
+            return
+        g.user_info = data
 
     @app.before_request
     def _enforce_api_auth():
@@ -96,12 +115,28 @@ def register_middleware(app: Flask) -> None:
         """
         if request.path in _PUBLIC_PATHS:
             return
-        if request.path.startswith("/api/") and g.get("user_info") is None:
+        if not request.path.startswith("/api/"):
+            return
+
+        user_info = g.get("user_info")
+        if user_info is None:
             return error_response(
                 "UNAUTHORIZED",
                 "Authentication required. Provide a valid Bearer token.",
                 401,
             )
+
+        service_id = current_app.config.get("SERVICE_ID", "")
+        if not service_id:
+            logger.warning("service_id_not_configured", request_path=request.path)
+        else:
+            user_services = user_info.get("services", [])
+            if not any(s.get("id") == service_id for s in user_services):
+                return error_response(
+                    "FORBIDDEN",
+                    "You do not have access to this service.",
+                    403,
+                )
 
     @app.before_request
     def _before() -> None:
@@ -125,5 +160,24 @@ def register_middleware(app: Flask) -> None:
             remote_addr=request.remote_addr,
         )
 
-        response.headers["X-Request-ID"] = request_id
+        response.headers["X-Request-ID"]              = request_id
+        response.headers["X-Content-Type-Options"]    = "nosniff"
+        response.headers["X-Frame-Options"]           = "DENY"
+        response.headers["Strict-Transport-Security"] = "max-age=63072000; includeSubDomains"
+        response.headers["Cache-Control"]             = "no-store"
+        response.headers["Referrer-Policy"]           = "strict-origin-when-cross-origin"
+
+        # Swagger UI needs CDN assets and inline scripts; all other endpoints
+        # get the strictest possible policy (pure JSON — no resources needed).
+        if request.path.startswith("/api/docs") or request.path == "/api/openapi.json":
+            response.headers["Content-Security-Policy"] = (
+                "default-src 'self'; "
+                "script-src 'self' https://cdn.jsdelivr.net 'unsafe-inline'; "
+                "style-src 'self' https://cdn.jsdelivr.net; "
+                "img-src 'self' data:; "
+                "connect-src 'self';"
+            )
+        else:
+            response.headers["Content-Security-Policy"] = "default-src 'none'"
+
         return response

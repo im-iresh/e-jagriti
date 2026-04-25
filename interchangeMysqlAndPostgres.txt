@@ -1,0 +1,82 @@
+Implementation Prompt: PostgreSQL → MySQL Dual-Database Support
+Context: This codebase (f:\vibe_code_bases\e-jagriti) uses SQLAlchemy 2.x with PostgreSQL. The goal is to support both PostgreSQL and MySQL, selected via DATABASE_URL env var. The plan file is at C:\Users\acer1\.claude\plans\wobbly-sparking-lightning.md — read it before starting.
+
+Implement the following changes in order:
+
+1. ingestion/db/upsert.py — dialect-aware upsert helper
+Read the file first. Add a _upsert(session, model, values, conflict_target, update_keys) -> int helper at the top that:
+
+Gets dialect = session.get_bind().dialect.name
+For "postgresql": uses sqlalchemy.dialects.postgresql.insert with .on_conflict_do_update(index_elements=..., set_=...) and .returning(model.id), returns scalar_one()
+For "mysql": uses sqlalchemy.dialects.mysql.insert with .on_duplicate_key_update(...), then does a follow-up select(model.id).where(...) to get the PK (MySQL ON DUPLICATE KEY UPDATE doesn't return rows)
+Raises NotImplementedError for other dialects
+Then rewrite all 6 existing upsert functions (upsert_commission, upsert_case, upsert_hearing, upsert_document, upsert_voc_complaint, and any others) as thin wrappers that call _upsert() with the appropriate conflict target and update keys. Remove the per-function pg_insert imports.
+
+2. api/db/queries.py — fix attach_voc_to_case() and get_stats()
+attach_voc_to_case(): Replace the pg_insert upsert with the same dialect-aware pattern — either extract a shared helper or inline the branch. The conflict target is voc_number; update keys are case_id, match_status, raw_payload, fetched_at.
+
+get_stats(): Replace the raw SQL that uses to_char(filing_date, 'YYYY-MM') and INTERVAL '12 months' with dialect-conditional ORM expressions:
+
+Check session.get_bind().dialect.name
+PostgreSQL: func.to_char(Case.filing_date, "YYYY-MM"), cutoff = func.current_date() - text("INTERVAL '12 months'")
+MySQL: func.date_format(Case.filing_date, "%Y-%m"), cutoff = func.date_sub(func.curdate(), text("INTERVAL 12 MONTH"))
+3. ingestion/db/session.py — dialect guard + ORM updated_at event
+Read the file. Make two changes:
+
+a) Wrap SET search_path TO public in a dialect check so it only executes for PostgreSQL:
+
+
+@event.listens_for(engine, "connect")
+def on_connect(dbapi_connection, connection_record):
+    if engine.dialect.name == "postgresql":
+        cursor = dbapi_connection.cursor()
+        cursor.execute("SET search_path TO public")
+        cursor.close()
+b) Add a SQLAlchemy before_flush ORM event to auto-set updated_at (replaces the PL/pgSQL trigger, works on any DB):
+
+
+from sqlalchemy import event as sa_event
+from datetime import datetime, timezone
+
+@sa_event.listens_for(Session, "before_flush")
+def set_updated_at(session, flush_context, instances):
+    now = datetime.now(timezone.utc)
+    for obj in session.dirty:
+        if hasattr(obj, "updated_at"):
+            obj.updated_at = now
+4. api/db/session.py — same ORM updated_at event
+Read the file and apply the same before_flush event listener as step 3b. (The SET search_path guard may or may not exist here — add it if present.)
+
+5. Migrations — make all 3 dialect-aware
+Read each of the following files and wrap PostgreSQL-specific DDL in bind = op.get_bind(); dialect = bind.dialect.name checks:
+
+migrations/versions/0001_initial_schema.py:
+
+Named ENUM types (e.g. sa.Enum(..., name="case_status_enum")) → wrap .create(bind) in if dialect == "postgresql"
+PL/pgSQL set_updated_at trigger and function → wrap in if dialect == "postgresql". Since the ORM event (step 3) now handles updated_at for application writes, these trigger definitions can be dropped entirely (remove from migration) — simplest approach.
+Partial index (postgresql_where) on cases — no change needed, SQLAlchemy silently ignores it on MySQL
+migrations/versions/0002_add_voc_complaints.py: Apply same dialect-guard pattern for any ENUM or trigger DDL.
+
+migrations/versions/0003_add_voc_number_to_cases.py:
+
+The partial index idx_cases_no_voc uses postgresql_where — wrap op.create_index(..., postgresql_where=...) in if dialect == "postgresql". On MySQL, create the index without the postgresql_where kwarg (it becomes a full index on id, still useful for covering).
+6. Requirements files
+In both ingestion/requirements.txt and api/requirements.txt, add after psycopg2-binary:
+
+
+# PyMySQL==1.1.0  # Uncomment for MySQL (only needed when DATABASE_URL uses mysql+pymysql://)
+7. .env.example
+After the existing DATABASE_URL=postgresql://... line add:
+
+
+# MySQL alternative:
+# DATABASE_URL=mysql+pymysql://ejagriti:ejagriti_secret@mysql:3306/ejagriti
+Verification
+After implementing, verify:
+
+grep -r "pg_insert" ingestion/ api/ — should return zero results (all removed)
+grep -r "to_char\|INTERVAL" api/db/queries.py — should return zero results
+grep "SET search_path" ingestion/db/session.py — should be inside an if dialect == "postgresql" block
+Run alembic upgrade head with DATABASE_URL=postgresql://... — no change in behaviour
+Run alembic upgrade head with DATABASE_URL=mysql+pymysql://... — schema created correctly
+Run an ingestion job twice and confirm upsert idempotency (row count stable)

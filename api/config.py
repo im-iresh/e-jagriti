@@ -54,10 +54,37 @@ class Config:
     LOG_DIR:   str = os.environ.get("EJAGRITI_LOG_DIR", "logs")
 
     # SSO
-    SSO_URL: str = os.environ.get("EJAGRITI_SSO_URL", "https://sso.example.com")
+    SSO_URL:    str = os.environ.get("EJAGRITI_SSO_URL", "https://sso.example.com")
+    SERVICE_ID: str = os.environ.get("EJAGRITI_SERVICE_ID", "")
 
-    # Complaint management system (CMS) — used by POST /api/cases/<id>/voc
-    CMS_BASE_URL: str = os.environ.get("EJAGRITI_CMS_BASE_URL", "")
+    # NFS mount root for PDF files — pdf_storage_path is resolved relative to this
+    # when the stored path is not absolute. Override with EJAGRITI_PDF_STORAGE_ROOT.
+    PDF_STORAGE_ROOT: str = os.environ.get("EJAGRITI_PDF_STORAGE_ROOT", "/mnt/pdfs")
+
+    # CORS — controlled entirely by environment variables.
+    #
+    # EJAGRITI_CORS_ORIGINS: comma-separated list of allowed origins, or "*".
+    #   e.g. "https://app.example.com,https://admin.example.com"
+    #   Defaults to "*" (allow all) which is safe behind an SSO auth gate.
+    #   Set to specific origins in production to restrict browser access.
+    #
+    # EJAGRITI_CORS_MAX_AGE: seconds browsers may cache preflight responses.
+    #   Default 600 (10 min). Reduce if allowed origins change frequently.
+    _cors_origins_raw: str = os.environ.get("EJAGRITI_CORS_ORIGINS", "*")
+    CORS_ORIGINS: list[str] | str = (
+        "*"
+        if _cors_origins_raw.strip() == "*"
+        else [o.strip() for o in _cors_origins_raw.split(",") if o.strip()]
+    )
+    CORS_MAX_AGE: int = int(os.environ.get("EJAGRITI_CORS_MAX_AGE", "600"))
+
+    # Swagger / OpenAPI (flask-smorest)
+    OPENAPI_VERSION: str = "3.0.3"
+    OPENAPI_URL_PREFIX: str = "/api"          # spec at /api/openapi.json
+    OPENAPI_SWAGGER_UI_PATH: str = "/docs"    # UI at /api/docs
+    OPENAPI_SWAGGER_UI_URL: str = "https://cdn.jsdelivr.net/npm/swagger-ui-dist/"
+    API_TITLE: str = "eJagriti Samsung Case API"
+    API_VERSION: str = "v1"
 
 
 class TestingConfig(Config):

@@ -15,7 +15,7 @@ from __future__ import annotations
 from typing import Any
 
 from flask import jsonify, Response
-from marshmallow import Schema, fields
+from marshmallow import Schema, fields, validate
 
 
 # ---------------------------------------------------------------------------
@@ -176,3 +176,127 @@ class StatsSchema(Schema):
     by_commission_type   = fields.Dict(keys=fields.Str(), values=fields.Int())
     cases_per_month      = fields.List(fields.Dict())
     last_ingestion_run   = fields.Dict(allow_none=True)
+
+
+# ---------------------------------------------------------------------------
+# Input schemas (query params / request bodies)
+# ---------------------------------------------------------------------------
+
+class CaseFilterSchema(Schema):
+    """Query params for GET /api/cases."""
+    page            = fields.Int(load_default=1)
+    per_page        = fields.Int(load_default=20)
+    status          = fields.Str(
+        load_default=None, allow_none=True,
+        validate=validate.OneOf(["open", "closed", "pending", "all"]),
+    )
+    commission_type = fields.Str(
+        load_default=None, allow_none=True,
+        validate=validate.OneOf(["national", "state", "district"]),
+    )
+    search          = fields.Str(load_default=None, allow_none=True)
+
+
+class OrderFilterSchema(Schema):
+    """Query params for GET /api/cases/<case_id>/hearings/<hearing_id>/orders."""
+    page     = fields.Int(load_default=1)
+    per_page = fields.Int(load_default=20)
+
+
+class AlertsQuerySchema(Schema):
+    """Query params for GET /api/cases/alerts."""
+    no_voc       = fields.Str(load_default=None, allow_none=True)
+    hearing_soon = fields.Str(load_default=None, allow_none=True)
+
+
+class BatchQuerySchema(Schema):
+    """Query params for GET /api/batch/status."""
+    runs = fields.Int(load_default=10)
+
+
+# ---------------------------------------------------------------------------
+# Output schemas — responses not yet covered by schemas above
+# ---------------------------------------------------------------------------
+
+class AlertCaseItemSchema(Schema):
+    """Single case item in an alert section."""
+    case_id              = fields.Int()
+    case_number          = fields.Str()
+    complainant_name     = fields.Str(allow_none=True)
+    commission_name      = fields.Str(allow_none=True)
+    commission_type      = fields.Str(allow_none=True)
+    date_of_next_hearing = fields.Str(allow_none=True)
+    status               = fields.Str()
+    case_stage           = fields.Str(allow_none=True)
+
+
+class AlertSectionSchema(Schema):
+    """One section (no_voc or hearing_soon) in the alerts response."""
+    count = fields.Int()
+    items = fields.List(fields.Nested(AlertCaseItemSchema))
+
+
+class AlertsResponseSchema(Schema):
+    """Response for GET /api/cases/alerts. Sections are only present when requested."""
+    no_voc       = fields.Nested(AlertSectionSchema, allow_none=True)
+    hearing_soon = fields.Nested(AlertSectionSchema, allow_none=True)
+
+
+class OrderDetailSchema(Schema):
+    """Daily order for GET /api/cases/<case_id>/hearings/<hearing_id>/orders."""
+    id               = fields.Int()
+    date             = fields.Str(allow_none=True)
+    order_type_id    = fields.Int()
+    pdf_fetched      = fields.Bool()
+    pdf_storage_path = fields.Str(allow_none=True)
+    pdf_fetched_at   = fields.Str(allow_none=True)
+    pdf_fetch_error  = fields.Str(allow_none=True)
+    pdf_url          = fields.Str(allow_none=True)
+
+
+class IngestionRunSchema(Schema):
+    """Single ingestion run summary."""
+    run_id           = fields.Int()
+    started_at       = fields.Str(allow_none=True)
+    finished_at      = fields.Str(allow_none=True)
+    status           = fields.Str(allow_none=True)
+    trigger_mode     = fields.Str(allow_none=True)
+    total_calls      = fields.Int()
+    success_count    = fields.Int()
+    fail_count       = fields.Int()
+    skip_count       = fields.Int(load_default=0)
+    duration_seconds = fields.Int(allow_none=True)
+    notes            = fields.Str(allow_none=True)
+
+
+class IngestionErrorSchema(Schema):
+    """Single ingestion error record."""
+    id            = fields.Int()
+    run_id        = fields.Int()
+    case_id       = fields.Int(allow_none=True)
+    endpoint      = fields.Str(allow_none=True)
+    http_status   = fields.Int(allow_none=True)
+    error_type    = fields.Str(allow_none=True)
+    error_message = fields.Str(allow_none=True)
+    retry_count   = fields.Int()
+    created_at    = fields.Str(allow_none=True)
+
+
+class QueueDepthsSchema(Schema):
+    """Queue depth counters in batch status."""
+    cases_pending_detail_fetch = fields.Int()
+    pdfs_pending_fetch         = fields.Int()
+    failed_jobs_unresolved     = fields.Int()
+
+
+class BatchStatusSchema(Schema):
+    """Response for GET /api/batch/status."""
+    recent_runs   = fields.List(fields.Nested(IngestionRunSchema))
+    queue_depths  = fields.Nested(QueueDepthsSchema)
+    recent_errors = fields.List(fields.Nested(IngestionErrorSchema))
+
+
+class HealthSchema(Schema):
+    """Response for GET /health."""
+    db_ok              = fields.Bool()
+    last_ingestion_run = fields.Nested(IngestionRunSchema, allow_none=True)

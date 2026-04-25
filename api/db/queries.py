@@ -16,15 +16,14 @@ from datetime import date, datetime, timedelta
 from typing import Any
 
 import structlog
-from sqlalchemy import func, select, text, update as sa_update
-from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy import case as sa_case, func, select, text
 from sqlalchemy.orm import joinedload
 
 from db.session import get_session
 
 # ORM models re-exported through api/models.py which resolves the ingestion
 # package path at import time (see that file for path logic).
-from models import Case, Commission, DailyOrder, FailedJob, IngestionError, IngestionRun, VocComplaint, VocMatchStatus  # noqa: E402
+from models import Case, Commission, DailyOrder, FailedJob, Hearing, IngestionError, IngestionRun  # noqa: E402
 
 logger = structlog.get_logger(__name__)
 
@@ -85,8 +84,21 @@ def get_cases_paginated(
         ).scalar_one()
 
         offset = (page - 1) * per_page
+        today = date.today()
         rows = session.execute(
-            query.order_by(Case.filing_date.desc().nullslast())
+            query.order_by(
+                # Group 0: has a future (or today) hearing date; Group 1: past/null
+                sa_case((Case.date_of_next_hearing >= today, 0), else_=1).asc(),
+                # Within group 0: soonest first; within group 1: expression is NULL → no-op
+                sa_case(
+                    (Case.date_of_next_hearing >= today, Case.date_of_next_hearing),
+                    else_=None,
+                ).asc().nullslast(),
+                # Secondary: most recently filed
+                Case.filing_date.desc().nullslast(),
+                # Final tiebreaker: deterministic, no variance across pages
+                Case.id.desc(),
+            )
             .offset(offset)
             .limit(per_page)
         ).all()
@@ -226,42 +238,88 @@ def get_case_by_number(case_number: str) -> dict[str, Any] | None:
 
 
 # ---------------------------------------------------------------------------
-# Orders
+# Hearings
 # ---------------------------------------------------------------------------
 
-def get_orders_for_case(
-    case_id: int,
-    from_date: date | None = None,
-    to_date: date | None = None,
-    page: int = 1,
-    per_page: int = 20,
-) -> dict[str, Any] | None:
+def get_hearings_for_case(case_id: int) -> list[dict[str, Any]] | None:
     """
-    Return paginated daily orders for a case.
+    Return all hearings for a case ordered by sequence number.
 
     Args:
         case_id: Internal case id.
-        from_date: Filter orders on or after this date.
-        to_date: Filter orders on or before this date.
-        page: 1-based page number.
-        per_page: Rows per page.
 
     Returns:
-        Dict with ``items`` and ``total``, or None if case not found.
+        List of hearing dicts, or None if the case does not exist.
     """
     with get_session(read_only=True) as session:
-        # Verify case exists
         exists = session.execute(
             select(Case.id).where(Case.id == case_id)
         ).scalar_one_or_none()
         if not exists:
             return None
 
-        q = select(DailyOrder).where(DailyOrder.case_id == case_id)
-        if from_date:
-            q = q.where(DailyOrder.date_of_hearing >= from_date)
-        if to_date:
-            q = q.where(DailyOrder.date_of_hearing <= to_date)
+        rows = session.execute(
+            select(Hearing)
+            .where(Hearing.case_id == case_id)
+            .order_by(Hearing.hearing_sequence_number.asc())
+        ).scalars().all()
+
+    return [
+        {
+            "id":                          h.id,
+            "court_room_hearing_id":       h.court_room_hearing_id,
+            "date":                        h.date_of_hearing.isoformat() if h.date_of_hearing else None,
+            "next_date":                   h.date_of_next_hearing.isoformat() if h.date_of_next_hearing else None,
+            "case_stage":                  h.case_stage,
+            "proceeding_text":             h.proceeding_text,
+            "sequence_number":             h.hearing_sequence_number,
+            "daily_order_available":       h.daily_order_availability_status == 2,
+        }
+        for h in rows
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Orders (per-hearing)
+# ---------------------------------------------------------------------------
+
+def _build_pdf_url(case_id: int, hearing_id: int, order_id: int, pdf_fetched: bool) -> str | None:
+    """Return the API path for the PDF endpoint, or None when PDF is not ready."""
+    if not pdf_fetched:
+        return None
+    return f"/api/cases/{case_id}/hearings/{hearing_id}/orders/{order_id}/pdf"
+
+
+def get_orders_for_hearing(
+    case_id: int,
+    hearing_id: int,
+    page: int = 1,
+    per_page: int = 20,
+) -> dict[str, Any] | None:
+    """
+    Return paginated daily orders for a specific hearing.
+
+    Args:
+        case_id:    Internal case id (used to verify the hearing belongs to this case).
+        hearing_id: Internal hearing id.
+        page:       1-based page number.
+        per_page:   Rows per page.
+
+    Returns:
+        Dict with ``items`` and ``total``, or None if case/hearing not found.
+    """
+    with get_session(read_only=True) as session:
+        # Verify hearing exists and belongs to the case
+        hearing_exists = session.execute(
+            select(Hearing.id).where(
+                Hearing.id == hearing_id,
+                Hearing.case_id == case_id,
+            )
+        ).scalar_one_or_none()
+        if not hearing_exists:
+            return None
+
+        q = select(DailyOrder).where(DailyOrder.hearing_id == hearing_id)
 
         total = session.execute(
             select(func.count()).select_from(q.subquery())
@@ -282,83 +340,49 @@ def get_orders_for_case(
             "pdf_storage_path": o.pdf_storage_path,
             "pdf_fetched_at":   o.pdf_fetched_at.isoformat() if o.pdf_fetched_at else None,
             "pdf_fetch_error":  o.pdf_fetch_error,
+            "pdf_url":          _build_pdf_url(case_id, hearing_id, o.id, o.pdf_fetched),
         }
         for o in rows
     ]
     return {"items": items, "total": total}
 
 
-# ---------------------------------------------------------------------------
-# Judgment
-# ---------------------------------------------------------------------------
-
-def get_judgment_for_case(case_id: int) -> dict[str, Any] | None:
+def get_order_pdf_path(
+    case_id: int,
+    hearing_id: int,
+    order_id: int,
+) -> dict[str, Any] | None:
     """
-    Return the judgment (orderTypeId=2) daily order for a case.
+    Return the pdf_storage_path and pdf_fetched flag for a single daily order.
+
+    Used by the PDF-serve endpoint to locate the file on NFS.
 
     Args:
-        case_id: Internal case id.
+        case_id:    Verified via hearing ownership.
+        hearing_id: Must match the order's hearing_id.
+        order_id:   Internal daily_orders PK.
 
     Returns:
-        Order dict or None if no judgment order exists for this case.
+        Dict with ``pdf_fetched`` and ``pdf_storage_path``, or None if not found.
     """
     with get_session(read_only=True) as session:
-        exists = session.execute(
-            select(Case.id).where(Case.id == case_id)
-        ).scalar_one_or_none()
-        if not exists:
-            return None
-
         row = session.execute(
-            select(DailyOrder)
-            .where(DailyOrder.case_id == case_id, DailyOrder.order_type_id == 2)
-            .order_by(DailyOrder.date_of_hearing.desc())
-            .limit(1)
-        ).scalar_one_or_none()
+            select(DailyOrder.pdf_fetched, DailyOrder.pdf_storage_path)
+            .join(Hearing, DailyOrder.hearing_id == Hearing.id)
+            .where(
+                DailyOrder.id == order_id,
+                DailyOrder.hearing_id == hearing_id,
+                Hearing.case_id == case_id,
+            )
+        ).one_or_none()
 
     if not row:
-        return {}  # Case exists but no judgment yet
-
-    return {
-        "id":               row.id,
-        "date":             row.date_of_hearing.isoformat() if row.date_of_hearing else None,
-        "pdf_fetched":      row.pdf_fetched,
-        "pdf_storage_path": row.pdf_storage_path,
-        "pdf_fetched_at":   row.pdf_fetched_at.isoformat() if row.pdf_fetched_at else None,
-    }
+        return None
+    return {"pdf_fetched": row.pdf_fetched, "pdf_storage_path": row.pdf_storage_path}
 
 
-# ---------------------------------------------------------------------------
-# Commissions
-# ---------------------------------------------------------------------------
 
-def get_all_commissions() -> list[dict[str, Any]]:
-    """
-    Return all commissions ordered by type and name.
 
-    This result is cached at the route level (TTL 1 h).
-
-    Returns:
-        List of commission dicts.
-    """
-    with get_session(read_only=True) as session:
-        rows = session.execute(
-            select(Commission).order_by(Commission.commission_type, Commission.name_en)
-        ).scalars().all()
-
-    return [
-        {
-            "id":                             r.id,
-            "commission_id_ext":              r.commission_id_ext,
-            "name":                           r.name_en,
-            "type":                           r.commission_type,
-            "state_id":                       r.state_id,
-            "district_id":                    r.district_id,
-            "case_prefix_text":               r.case_prefix_text,
-            "parent_commission_id":           r.parent_commission_id,
-        }
-        for r in rows
-    ]
 
 
 # ---------------------------------------------------------------------------
@@ -444,82 +468,18 @@ def get_stats() -> dict[str, Any]:
     }
 
 
-# ---------------------------------------------------------------------------
-# VOC attachment (write path — uses primary DB)
-# ---------------------------------------------------------------------------
-
-def attach_voc_to_case(case_id: int, voc_number: int, cms_payload: dict) -> dict[str, Any]:
-    """
-    Manually link a VOC complaint to a case.
-
-    Upserts the voc_complaints row (match_status=matched) and stamps
-    cases.voc_number so the no-VOC alert index stays accurate.
-
-    Uses get_session() without read_only so writes go to the primary DB.
-
-    Args:
-        case_id:     Internal surrogate id of the target case.
-        voc_number:  VOC complaint number from the CMS.
-        cms_payload: Full JSON response from the CMS (stored as raw_payload).
-
-    Returns:
-        Dict with ``case_id`` and ``voc_number``.
-
-    Raises:
-        LookupError:        case_id does not exist in the DB.
-        ValueError("conflict"): voc_number is already linked to a different case.
-    """
-    with get_session() as session:
-        # 1. Verify case exists
-        exists = session.execute(
-            select(Case.id).where(Case.id == case_id)
-        ).scalar_one_or_none()
-        if not exists:
-            raise LookupError(f"Case {case_id} not found")
-
-        # 2. Conflict check — VOC already linked to a different case?
-        linked_case_id = session.execute(
-            select(VocComplaint.case_id).where(VocComplaint.voc_number == voc_number)
-        ).scalar_one_or_none()
-        if linked_case_id is not None and linked_case_id != case_id:
-            raise ValueError("conflict")
-
-        # 3. Upsert voc_complaints row
-        stmt = (
-            pg_insert(VocComplaint)
-            .values(
-                voc_number=voc_number,
-                case_id=case_id,
-                match_status=VocMatchStatus.matched,
-                raw_payload=json.dumps(cms_payload),
-            )
-            .on_conflict_do_update(
-                index_elements=["voc_number"],
-                set_={
-                    "case_id":      pg_insert(VocComplaint).excluded.case_id,
-                    "match_status": pg_insert(VocComplaint).excluded.match_status,
-                    "raw_payload":  pg_insert(VocComplaint).excluded.raw_payload,
-                    "updated_at":   func.now(),
-                },
-            )
-        )
-        session.execute(stmt)
-
-        # 4. Stamp cases.voc_number so the partial index stays accurate
-        session.execute(
-            sa_update(Case).where(Case.id == case_id).values(voc_number=voc_number)
-        )
-
-    return {"case_id": case_id, "voc_number": voc_number}
 
 
 # ---------------------------------------------------------------------------
 # Alerts
 # ---------------------------------------------------------------------------
 
-def get_alert_cases() -> dict[str, Any]:
+def get_alert_cases(
+    include_no_voc: bool = True,
+    include_hearing_soon: bool = True,
+) -> dict[str, Any]:
     """
-    Return open/pending cases grouped by two alert conditions.
+    Return open/pending cases grouped by requested alert conditions.
 
     Sections:
       no_voc       — cases where voc_number IS NULL (no VOC complaint linked).
@@ -527,12 +487,22 @@ def get_alert_cases() -> dict[str, Any]:
       hearing_soon — cases where date_of_next_hearing falls within the next
                      2 days (today through today + 2, inclusive).
 
-    Closed cases are excluded from both sections.
+    Closed cases are excluded from both sections. If both flags are False
+    (i.e. no query params supplied) both sections are returned by default.
+
+    Args:
+        include_no_voc:      Include the no_voc section.
+        include_hearing_soon: Include the hearing_soon section.
 
     Returns:
-        Dict with ``no_voc`` and ``hearing_soon`` keys, each containing
+        Dict with the requested section keys, each containing
         ``count`` (int) and ``items`` (list of case dicts).
     """
+    # If caller passed no filter flags, return everything
+    if not include_no_voc and not include_hearing_soon:
+        include_no_voc = True
+        include_hearing_soon = True
+
     today = date.today()
     cutoff = today + timedelta(days=2)
 
@@ -552,16 +522,22 @@ def get_alert_cases() -> dict[str, Any]:
         .where(Case.status.in_(["open", "pending"]))
     )
 
-    with get_session(read_only=True) as session:
-        no_voc_rows = session.execute(
-            _base.where(Case.voc_number.is_(None))
-            .order_by(Case.filing_date.desc().nullslast())
-        ).all()
+    result: dict[str, Any] = {}
 
-        hearing_rows = session.execute(
-            _base.where(Case.date_of_next_hearing.between(today, cutoff))
-            .order_by(Case.date_of_next_hearing.asc())
-        ).all()
+    with get_session(read_only=True) as session:
+        if include_no_voc:
+            no_voc_rows = session.execute(
+                _base.where(Case.voc_number.is_(None))
+                .order_by(Case.filing_date.desc().nullslast())
+            ).all()
+            result["no_voc"] = no_voc_rows
+
+        if include_hearing_soon:
+            hearing_rows = session.execute(
+                _base.where(Case.date_of_next_hearing.between(today, cutoff))
+                .order_by(Case.date_of_next_hearing.asc())
+            ).all()
+            result["hearing_soon"] = hearing_rows
 
     def _serialize(r) -> dict[str, Any]:
         return {
@@ -576,14 +552,8 @@ def get_alert_cases() -> dict[str, Any]:
         }
 
     return {
-        "no_voc": {
-            "count": len(no_voc_rows),
-            "items": [_serialize(r) for r in no_voc_rows],
-        },
-        "hearing_soon": {
-            "count": len(hearing_rows),
-            "items": [_serialize(r) for r in hearing_rows],
-        },
+        key: {"count": len(rows), "items": [_serialize(r) for r in rows]}
+        for key, rows in result.items()
     }
 
 

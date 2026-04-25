@@ -9,13 +9,13 @@ This guide covers everything you need to understand, run, and extend the API ser
 1. [Overview](#1-overview)
 2. [Repository Layout](#2-repository-layout)
 3. [Response Envelope](#3-response-envelope)
-4. [Middleware](#4-middleware)
+4. [Middleware & Auth](#4-middleware--auth)
 5. [Configuration & Environment Variables](#5-configuration--environment-variables)
-6. [Endpoints Reference](#6-endpoints-reference) *(Part 2)*
-7. [Caching](#7-caching) *(Part 2)*
-8. [Rate Limiting](#8-rate-limiting) *(Part 2)*
-9. [Adding a New Endpoint](#9-adding-a-new-endpoint) *(Part 2)*
-10. [Running Locally](#10-running-locally) *(Part 2)*
+6. [Endpoints Reference](#6-endpoints-reference)
+7. [Caching](#7-caching)
+8. [Rate Limiting](#8-rate-limiting)
+9. [Adding a New Endpoint](#9-adding-a-new-endpoint)
+10. [Running Locally](#10-running-locally)
 
 ---
 
@@ -33,10 +33,10 @@ The ingestion service writes to PostgreSQL. The API service sits in front of tha
 
 | Resource | Endpoints |
 |----------|-----------|
-| Cases | `GET /api/cases` (list + filters), `GET /api/cases/<id>` (detail) |
-| Orders | `GET /api/cases/<id>/orders` (paginated daily orders) |
-| Judgments | `GET /api/cases/<id>/judgment` (PDF status) |
-| Commissions | `GET /api/commissions` (full list) |
+| Cases | `GET /api/cases` (list + filters), `GET /api/cases/<id>` (detail), `GET /api/cases/alerts` (alert feed) |
+| Hearings | `GET /api/cases/<id>/hearings` (hearing list for a case) |
+| Orders | `GET /api/cases/<case_id>/hearings/<hearing_id>/orders` (paginated daily orders per hearing) |
+| PDF | `GET /api/cases/<case_id>/hearings/<hearing_id>/orders/<order_id>/pdf` (stream PDF from NFS) |
 | Stats | `GET /api/stats` (aggregate counts + monthly series) |
 | Health | `GET /health` (DB liveness + last ingestion run) |
 | Batch Status | `GET /api/batch/status` (ingestion pipeline status for debugging) |
@@ -47,6 +47,7 @@ The ingestion service writes to PostgreSQL. The API service sits in front of tha
 - `SQLAlchemy 2.x` ORM for database access (shared models with ingestion service)
 - `Flask-Caching 2.x` for Redis-backed response caching
 - `Flask-Limiter 3.x` for per-IP rate limiting
+- `Flask-CORS 4.x` for CORS header management
 - `marshmallow 3.x` for response schema documentation
 - `structlog` for structured JSON logging
 - `gunicorn` as the production WSGI server
@@ -66,7 +67,10 @@ e-jagriti/
 │   ├── app.py                  # Application factory: create_app()
 │   │                           # Registers extensions, blueprints, error handlers
 │   ├── config.py               # Config and TestingConfig classes loaded from env
-│   ├── middleware.py           # Request ID injection + structured request logging
+│   ├── auth.py                 # require_permission() decorator + PERMISSIONS registry
+│   │                           # Reads service/role/permission structure from g.user_info
+│   ├── middleware.py           # SSO token resolution, service access gate,
+│   │                           # request ID injection, structured request logging
 │   ├── models.py               # Shim: adds ingestion/ to sys.path, re-exports ORM models
 │   │                           # Both services share the same model definitions
 │   ├── requirements.txt        # Python dependencies
@@ -79,10 +83,10 @@ e-jagriti/
 │   │
 │   ├── routes/                 # One module per resource group (Flask Blueprint per file)
 │   │   ├── __init__.py
-│   │   ├── cases.py            # GET /api/cases, GET /api/cases/<id>
-│   │   ├── orders.py           # GET /api/cases/<id>/orders
-│   │   ├── judgments.py        # GET /api/cases/<id>/judgment
-│   │   ├── commissions.py      # GET /api/commissions
+│   │   ├── cases.py            # GET /api/cases, /api/cases/alerts, /api/cases/<id>,
+│   │   │                       # GET /api/cases/<id>/hearings
+│   │   ├── orders.py           # GET /api/cases/<cid>/hearings/<hid>/orders
+│   │   │                       # GET /api/cases/<cid>/hearings/<hid>/orders/<oid>/pdf
 │   │   ├── stats.py            # GET /api/stats, GET /health
 │   │   └── batch.py            # GET /api/batch/status (developer debugging)
 │   │
@@ -104,13 +108,21 @@ e-jagriti/
 app.py (create_app)
   └─ loads .env (python-dotenv)
   └─ reads config from config.py (get_config → Config or TestingConfig)
-  └─ initialises Cache and Limiter extensions
+  └─ initialises Cache, Limiter, CORS extensions
   └─ calls register_middleware(app) from middleware.py
-  └─ registers 6 Blueprints from routes/
+  └─ registers 4 Blueprints from routes/
 
 routes/*.py
   └─ each route calls one or more query functions from db/queries.py
+  └─ uses @require_permission() from auth.py
   └─ wraps results with success_response() / error_response() from schemas/responses.py
+
+middleware.py
+  └─ _resolve_user: calls SSO userinfo endpoint, sets g.user_info = rsp["rsp"]["data"]
+  └─ _enforce_api_auth: checks g.user_info is set + user has access to this service
+
+auth.py
+  └─ require_permission(permission_id): checks user's roles/permissions against required permission
 
 db/queries.py
   └─ imports ORM models from models.py (the shim)
@@ -136,7 +148,7 @@ Every endpoint returns one of two JSON shapes. Routes never return raw dicts —
 
 ### 3.1 Success — non-paginated
 
-Used when returning a single object or a non-paginated list (e.g. `/api/commissions`, `/api/cases/<id>`).
+Used when returning a single object or a non-paginated list (e.g. `/api/cases/<id>`).
 
 ```json
 {
@@ -160,7 +172,7 @@ return success_response(data, status=201)
 
 ### 3.2 Success — paginated
 
-Used when returning a list with pagination metadata (e.g. `GET /api/cases`, `GET /api/cases/<id>/orders`). Pass `page`, `per_page`, and `total` to `success_response()` and the `meta.pagination` block is added automatically.
+Used when returning a list with pagination metadata (e.g. `GET /api/cases`, `GET /api/cases/<case_id>/hearings/<hearing_id>/orders`). Pass `page`, `per_page`, and `total` to `success_response()` and the `meta.pagination` block is added automatically.
 
 ```json
 {
@@ -221,13 +233,18 @@ Common error codes used across routes:
 
 | Code | HTTP status | When |
 |------|-------------|------|
+| `UNAUTHORIZED` | 401 | No valid Bearer token provided |
+| `FORBIDDEN` | 403 | Token valid but user lacks service access or required permission |
 | `NOT_FOUND` | 404 | Resource does not exist |
+| `PDF_NOT_READY` | 404 | Order exists but PDF has not been fetched yet |
+| `FILE_NOT_FOUND` | 404 | `pdf_storage_path` is set but file is missing on NFS disk |
 | `INVALID_PARAMS` | 400 | `page`, `per_page`, or `runs` is not an integer |
 | `INVALID_STATUS` | 400 | `status` query param is not a valid enum value |
 | `INVALID_COMMISSION_TYPE` | 400 | `commission_type` not in `national/state/district` |
-| `INVALID_DATE` | 400 | Date param not in `YYYY-MM-DD` format |
 | `METHOD_NOT_ALLOWED` | 405 | Wrong HTTP method |
 | `RATE_LIMIT_EXCEEDED` | 429 | Client hit the rate limit |
+| `SSO_UNAVAILABLE` | 503 | Could not connect to the SSO service (timeout or network error) |
+| `CONFIGURATION_ERROR` | 500 | Server misconfiguration (e.g. `SSO_URL` or `SERVICE_ID` not set) |
 | `INTERNAL_ERROR` | 500 | Unhandled exception (logged server-side) |
 
 Python call:
@@ -238,26 +255,110 @@ return error_response("NOT_FOUND", f"Case {case_id} not found", 404)
 
 ---
 
-## 4. Middleware
+## 4. Middleware & Auth
 
-Middleware is registered in `middleware.py` via `register_middleware(app)`, called inside `create_app()` before blueprints are loaded. It attaches two `before_request` / `after_request` hooks.
+Middleware is registered in `middleware.py` via `register_middleware(app)`, called inside `create_app()` before blueprints are loaded.
+
+Hook execution order per request:
+
+```
+1. _resolve_user      — calls SSO, populates g.user_info
+2. _enforce_api_auth  — checks auth + service membership for /api/* paths
+3. _before            — assigns request ID, records start time
+   ... route handler runs ...
+4. _after             — logs request, injects response headers
+```
 
 ---
 
-### 4.1 Request ID
+### 4.1 SSO Token Resolution (`_resolve_user`)
+
+Fires on every request that carries an `Authorization: Bearer <token>` header. Calls `GET {SSO_URL}/api/v1/sso/userInfo` and extracts the user object from `response["rsp"]["data"]`, storing it on `g.user_info`.
+
+**Error cases and their responses:**
+
+| Scenario | Response |
+|----------|----------|
+| No `Authorization: Bearer` header | `g.user_info = None`; `_enforce_api_auth` returns **401** |
+| `EJAGRITI_SSO_URL` not configured | **500** `CONFIGURATION_ERROR` |
+| Network error or timeout reaching SSO | **503** `SSO_UNAVAILABLE` |
+| SSO returns non-200 (401, 403, 500, etc.) | SSO response proxied back as-is (same body + status code) |
+| SSO returns 200 but `rsp.data` is null/missing | `g.user_info = None`; `_enforce_api_auth` returns **401** (logged as warning) |
+| SSO returns 200 with valid `rsp.data` | `g.user_info = data`; request proceeds |
+
+**Expected SSO user object shape** (stored in `g.user_info`):
+
+```json
+{
+  "uuid": "...",
+  "userID": "u123",
+  "services": [
+    { "id": "svc-001", "name": "eJagriti", "domain": "jagriti.example.com" }
+  ],
+  "roles": [
+    { "roleId": "role-1", "roleName": "CaseViewer", "serviceId": "svc-001" }
+  ],
+  "permissions": [
+    { "permissionId": "p-1", "permissionName": "cases:read", "roleIdList": ["role-1"] }
+  ]
+}
+```
+
+---
+
+### 4.2 API Auth & Service Gate (`_enforce_api_auth`)
+
+Runs for every `/api/*` path not in `_PUBLIC_PATHS` (`/health`, `/api/docs`, `/api/openapi.json`).
+
+Two checks in sequence:
+
+1. **Authentication** — if `g.user_info` is `None` → return **401 UNAUTHORIZED**
+2. **Service access** — if `EJAGRITI_SERVICE_ID` is set, verify the user's `services[]` list contains a service with that ID → return **403 FORBIDDEN** if not found
+
+If `EJAGRITI_SERVICE_ID` is not configured, the service check is skipped but a warning is logged on every request.
+
+---
+
+### 4.3 Permission Check (`require_permission` in `auth.py`)
+
+A route decorator that enforces fine-grained permission control on top of the service gate. Applied per-route:
+
+```python
+@cases_bp.get("")
+@require_permission("cases:read")
+def list_cases(): ...
+```
+
+**How the check works:**
+
+1. Collect the user's role IDs scoped to the configured `SERVICE_ID`:
+   `{r["roleId"] for r in user_info["roles"] if r["serviceId"] == SERVICE_ID}`
+2. Search `user_info["permissions"]` for an entry where `permissionName == permission_id`
+3. Check if that permission's `roleIdList` intersects with the user's role IDs → **403** if not
+
+**Permission registry** (defined in `auth.py`):
+
+| Permission | Covers |
+|------------|--------|
+| `cases:read` | Case list, case detail, alerts, hearings |
+| `orders:read` | Daily orders and PDF serving |
+| `stats:read` | Aggregate statistics |
+| `batch:read` | Batch run status |
+
+---
+
+### 4.4 Request ID
 
 Every request is assigned a UUID stored on Flask's `g` object and echoed back in the `X-Request-ID` response header.
 
-**How it works:**
+1. `_before`: reads `X-Request-ID` from the incoming headers. If present, reuses it (lets clients correlate their own IDs). If absent, generates a new `uuid.uuid4()`.
+2. `_after`: writes the ID into `response.headers["X-Request-ID"]`.
 
-1. `before_request`: reads `X-Request-ID` from the incoming headers. If present, reuses it (lets clients correlate their own IDs). If absent, generates a new `uuid.uuid4()`.
-2. `after_request`: writes the ID into `response.headers["X-Request-ID"]`.
-
-**Why it matters:** The request ID is not yet bound to the structlog context, but it is visible in the response headers. When debugging a specific failed request you can pass your own `X-Request-ID` header and trace it through server logs by grepping for the UUID.
+When debugging a specific failed request you can pass your own `X-Request-ID` header and trace it through server logs by grepping for the UUID.
 
 ---
 
-### 4.2 Structured Request Logging
+### 4.5 Structured Request Logging
 
 After every request, middleware emits a single structured JSON log line via structlog:
 
@@ -275,7 +376,22 @@ After every request, middleware emits a single structured JSON log line via stru
 }
 ```
 
-`duration_ms` is measured with `time.monotonic()` from the `before_request` hook — it covers full request processing including DB query time. All logs go to stdout (captured by your container orchestrator).
+`duration_ms` is measured with `time.monotonic()` — it covers full request processing including DB query time.
+
+---
+
+### 4.6 Security Headers
+
+Injected by `_after` on every response:
+
+| Header | Value |
+|--------|-------|
+| `X-Content-Type-Options` | `nosniff` |
+| `X-Frame-Options` | `DENY` |
+| `Strict-Transport-Security` | `max-age=63072000; includeSubDomains` |
+| `Cache-Control` | `no-store` |
+| `Referrer-Policy` | `strict-origin-when-cross-origin` |
+| `Content-Security-Policy` | `default-src 'none'` (strict); relaxed for `/api/docs` to allow Swagger UI CDN assets |
 
 ---
 
@@ -297,17 +413,22 @@ Set variables in a `.env` file at `api/.env` (loaded by `python-dotenv` inside `
 | Variable | Default | Required | Description |
 |----------|---------|----------|-------------|
 | `DATABASE_URL` | *(none)* | **Yes** | PostgreSQL connection string. e.g. `postgresql://user:pass@localhost:5432/ejagriti`. Raises `RuntimeError` at startup if missing. |
-| `REPLICA_DATABASE_URL` | `None` | No | If set, all `read_only=True` sessions are routed here instead of the primary. Useful for separating read traffic. When unset, both read and write sessions use `DATABASE_URL`. |
+| `REPLICA_DATABASE_URL` | `None` | No | If set, all `read_only=True` sessions are routed here instead of the primary. When unset, both read and write sessions use `DATABASE_URL`. |
 | `SECRET_KEY` | `dev-secret-change-in-prod` | **Yes in prod** | Flask secret key used for session signing. Override with a random string in production. |
 | `FLASK_ENV` | `production` | No | Controls which Config class is loaded. Set to `testing` in CI. |
 | `DEBUG` | `false` | No | Enables Flask debug mode (auto-reload, detailed tracebacks). Never set `true` in production. |
-| `REDIS_URL` | `redis://localhost:6379/0` | No | Redis connection URL. Used by both Flask-Caching and Flask-Limiter. If not set, caching falls back to `SimpleCache` (in-process) and rate limiting to `memory://` (per-process, not shared). |
-| `EJAGRITI_CACHE_TTL_SECONDS` | `3600` | No | Default TTL for cached responses in seconds. Applies to `/api/commissions` and `/api/stats`. Set lower in development if you need fresher data. |
-| `EJAGRITI_RATE_LIMIT_PER_MINUTE` | `100` | No | Max requests per minute per IP address. Flask-Limiter enforces this globally. Individual routes can override it with a `@limiter.limit(...)` decorator. |
-| `EJAGRITI_LOG_LEVEL` | `INFO` | No | Structlog/stdlib log level. Accepted values: `DEBUG`, `INFO`, `WARNING`, `ERROR`. Set `DEBUG` locally to see all SQL queries and session events. |
-| `EJAGRITI_SA_POOL_SIZE` | `5` | No | SQLAlchemy connection pool size (persistent connections kept open). Increase for high-concurrency deployments. |
-| `EJAGRITI_SA_MAX_OVERFLOW` | `10` | No | Extra connections allowed above `SA_POOL_SIZE` when the pool is saturated. Total max connections = `SA_POOL_SIZE + SA_MAX_OVERFLOW`. |
-| `TEST_DATABASE_URL` | falls back to `DATABASE_URL` | No | Used by `TestingConfig` so tests can target a separate database without overwriting `DATABASE_URL`. |
+| `REDIS_URL` | `redis://localhost:6379/0` | No | Redis connection URL. Used by both Flask-Caching and Flask-Limiter. Falls back to SimpleCache / memory:// if unset. |
+| `EJAGRITI_SSO_URL` | `https://sso.example.com` | **Yes in prod** | Base URL of the SSO service. The API calls `{SSO_URL}/api/v1/sso/userInfo` to validate tokens. Returns 500 `CONFIGURATION_ERROR` if unset when a Bearer token is received. |
+| `EJAGRITI_SERVICE_ID` | *(empty)* | **Yes in prod** | The service ID that this API is registered under in the SSO. Users must have this service in their `services[]` list to access any `/api/*` endpoint. If unset, service check is skipped (warning logged). |
+| `EJAGRITI_PDF_STORAGE_ROOT` | `/mnt/pdfs` | No | NFS mount root for PDF files. When `pdf_storage_path` in the DB is a relative path, it is resolved relative to this root. |
+| `EJAGRITI_CORS_ORIGINS` | `*` | No | Comma-separated list of allowed CORS origins, or `*` to allow all. e.g. `https://app.example.com,https://admin.example.com`. Defaults to `*` which is safe behind an SSO auth gate. |
+| `EJAGRITI_CORS_MAX_AGE` | `600` | No | Seconds browsers may cache preflight responses (10 min default). |
+| `EJAGRITI_CACHE_TTL_SECONDS` | `3600` | No | Default TTL for cached responses in seconds. Applies to `/api/stats`. |
+| `EJAGRITI_RATE_LIMIT_PER_MINUTE` | `100` | No | Max requests per minute per IP address. |
+| `EJAGRITI_LOG_LEVEL` | `INFO` | No | Structlog/stdlib log level. Accepted values: `DEBUG`, `INFO`, `WARNING`, `ERROR`. |
+| `EJAGRITI_SA_POOL_SIZE` | `5` | No | SQLAlchemy connection pool size per engine (persistent connections). |
+| `EJAGRITI_SA_MAX_OVERFLOW` | `10` | No | Extra connections allowed above pool size. Total max = `SA_POOL_SIZE + SA_MAX_OVERFLOW`. |
+| `TEST_DATABASE_URL` | falls back to `DATABASE_URL` | No | Used by `TestingConfig` for a separate test database. |
 
 ---
 
@@ -319,8 +440,11 @@ SECRET_KEY=local-dev-secret
 FLASK_ENV=development
 DEBUG=true
 EJAGRITI_LOG_LEVEL=DEBUG
+EJAGRITI_SSO_URL=https://sso.example.com
+EJAGRITI_SERVICE_ID=svc-001
 # REDIS_URL=redis://localhost:6379/0   # uncomment if Redis is running locally
 # REPLICA_DATABASE_URL=               # leave unset to use primary for reads
+# EJAGRITI_PDF_STORAGE_ROOT=/mnt/pdfs # override if PDFs are mounted elsewhere
 ```
 
 ---
@@ -329,8 +453,8 @@ EJAGRITI_LOG_LEVEL=DEBUG
 
 Flask-Caching and Flask-Limiter both read `REDIS_URL` at startup:
 
-- **With Redis:** Cache is shared across all gunicorn workers and container replicas. Rate limit counters are also shared (prevents a single IP from bypassing limits by hitting different workers).
-- **Without Redis:** `CACHE_TYPE` falls back to `SimpleCache` (per-process, in-memory). Rate limit storage falls back to `memory://` (also per-process). This is fine for local development or single-worker deployments, but in a multi-worker / multi-replica setup each process has its own counter — the effective limit multiplies by the number of processes.
+- **With Redis:** Cache is shared across all gunicorn workers and container replicas. Rate limit counters are also shared.
+- **Without Redis:** `CACHE_TYPE` falls back to `SimpleCache` (per-process, in-memory). Rate limit storage falls back to `memory://`. Fine for local development or single-worker deployments but not for multi-worker setups.
 
 ---
 
@@ -342,20 +466,21 @@ The total number of Postgres connections the API can hold open is:
 max_connections = (SA_POOL_SIZE + SA_MAX_OVERFLOW) × gunicorn_workers
 ```
 
-With defaults (5 + 10 = 15) and 4 gunicorn workers that's 60 connections. Postgres's default `max_connections` is 100, so with both the API and ingestion service running you should either raise Postgres's limit or use PgBouncer in transaction mode.
+With defaults (5 + 10 = 15) and 4 gunicorn workers that's 60 connections. If a read replica is configured, each engine maintains its own separate pool, doubling the total. Postgres's default `max_connections` is 100, so with both the API and ingestion service running you should either raise Postgres's limit or use PgBouncer in transaction mode.
 
 ---
 
 ## 6. Endpoints Reference
 
-All endpoints are prefixed with no version segment (e.g. `/api/cases`, not `/v1/api/cases`). All responses use the envelope described in section 3.
+All endpoints are prefixed with no version segment (e.g. `/api/cases`, not `/v1/api/cases`). All responses use the envelope described in section 3. All `/api/*` endpoints require a valid Bearer token; `/health` is public.
 
 ---
 
 ### 6.1 `GET /api/cases` — List cases
 
 **Blueprint:** `cases_bp` (`routes/cases.py`)
-**Purpose:** Paginated, filterable list of all Samsung cases. This is the primary data source for the homepage table.
+**Auth:** `cases:read`
+**Purpose:** Paginated, filterable list of all Samsung cases.
 
 **Query parameters:**
 
@@ -370,7 +495,8 @@ All endpoints are prefixed with no version segment (e.g. `/api/cases`, not `/v1/
 **Example request:**
 
 ```bash
-curl "http://localhost:8000/api/cases?status=open&commission_type=district&search=samsung&page=1&per_page=5"
+curl -H "Authorization: Bearer <token>" \
+  "http://localhost:8000/api/cases?status=open&commission_type=district&page=1&per_page=5"
 ```
 
 **Example response:**
@@ -393,36 +519,51 @@ curl "http://localhost:8000/api/cases?status=open&commission_type=district&searc
     }
   ],
   "meta": {
-    "pagination": {
-      "page": 1,
-      "per_page": 5,
-      "total": 347,
-      "total_pages": 70
-    }
+    "pagination": { "page": 1, "per_page": 5, "total": 347, "total_pages": 70 }
   }
 }
 ```
 
-**Notes:**
-- Results are ordered by `filing_date DESC NULLS LAST`.
-- `status=all` is equivalent to omitting the `status` parameter — both return cases of every status.
-- `search` runs `ILIKE '%term%'` on two columns; it is not a full-text index. Avoid very short search strings on large datasets.
+**Ordering:**
+
+Cases are ordered by four keys in priority order:
+
+1. Cases with a future hearing date come before cases with no upcoming hearing.
+2. Within the "upcoming" group: soonest hearing date first.
+3. Within the "no upcoming hearing" group: most recently filed first.
+4. Final tiebreaker: `case_id DESC` (deterministic pagination).
+
+This is a CASE expression sort — no index is used. At ~10k rows PostgreSQL sorts in memory in under 20 ms.
 
 ---
 
-### 6.2 `GET /api/cases/alerts` — Alert cases for notifications
+### 6.2 `GET /api/cases/alerts` — Alert cases
 
 **Blueprint:** `cases_bp` (`routes/cases.py`)
-**Purpose:** Returns open/pending cases that need attention, grouped into two named alert sections. Designed for notification feeds and operator dashboards.
-
 **Auth:** `cases:read`
+**Purpose:** Open/pending cases that need attention, grouped into alert sections. Designed for notification feeds and operator dashboards.
 **Caching:** Not cached — always returns live data.
-**Pagination:** None — returns all matching cases.
 
-**Example request:**
+**Query parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `no_voc` | string | Pass `Y` to include cases with no linked VOC complaint |
+| `hearing_soon` | string | Pass `Y` to include cases with a hearing in the next 2 days |
+
+Omitting both parameters returns all alert sections.
+
+**Example requests:**
 
 ```bash
-curl http://localhost:8000/api/cases/alerts
+# All alerts
+curl -H "Authorization: Bearer <token>" http://localhost:8000/api/cases/alerts
+
+# Only cases without VOC
+curl -H "Authorization: Bearer <token>" "http://localhost:8000/api/cases/alerts?no_voc=Y"
+
+# Only imminent hearings
+curl -H "Authorization: Bearer <token>" "http://localhost:8000/api/cases/alerts?hearing_soon=Y"
 ```
 
 **Response shape:**
@@ -448,53 +589,35 @@ curl http://localhost:8000/api/cases/alerts
     },
     "hearing_soon": {
       "count": 3,
-      "items": [
-        {
-          "case_id": 205,
-          "case_number": "SC/1/CC/22/2024",
-          "complainant_name": "Sunita Sharma",
-          "commission_name": "Delhi State Consumer Disputes Redressal Commission",
-          "commission_type": "state",
-          "date_of_next_hearing": "2025-04-05",
-          "status": "open",
-          "case_stage": "Arguments"
-        }
-      ]
+      "items": [...]
     }
   }
 }
 ```
 
+When only one section is requested, only that key is present in `data`.
+
 **Alert conditions:**
 
-| Section | Condition | Query |
-|---------|-----------|-------|
-| `no_voc` | Case has no linked VOC complaint | `cases.voc_number IS NULL` |
-| `hearing_soon` | Next hearing within 2 days (today through today+2, inclusive) | `date_of_next_hearing BETWEEN today AND today+2` |
+| Section | Condition |
+|---------|-----------|
+| `no_voc` | `cases.voc_number IS NULL` — uses partial index `idx_cases_no_voc` |
+| `hearing_soon` | `date_of_next_hearing BETWEEN today AND today+2` |
 
-**Notes:**
-- Both sections only include `status = open` or `status = pending` cases. Closed cases are excluded.
-- `no_voc` items are ordered by `filing_date DESC`. `hearing_soon` items are ordered by `date_of_next_hearing ASC` (most imminent first).
-- A case can appear in both sections simultaneously if it has no VOC and also has an imminent hearing.
-- `no_voc` uses the partial index `idx_cases_no_voc` — no join against `voc_complaints` is performed. `cases.voc_number` is denormalised from `voc_complaints` and kept in sync by the `fetch_voc` ingestion job.
+Both sections only include `status = open` or `status = pending` cases.
 
 ---
 
 ### 6.3 `GET /api/cases/<case_id>` — Case detail
 
 **Blueprint:** `cases_bp` (`routes/cases.py`)
-**Purpose:** Full nested case object including commission, all hearings in sequence order, and all daily order PDF records.
-
-**Path parameters:**
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `case_id` | integer | Internal surrogate PK from the `cases` table |
+**Auth:** `cases:read`
+**Purpose:** Full nested case object including commission, all hearings in sequence order, and daily order records.
 
 **Example request:**
 
 ```bash
-curl "http://localhost:8000/api/cases/42"
+curl -H "Authorization: Bearer <token>" http://localhost:8000/api/cases/42
 ```
 
 **Example response:**
@@ -506,17 +629,13 @@ curl "http://localhost:8000/api/cases/42"
     "case_id": 42,
     "case_number": "DC/77/CC/104/2025",
     "filing_date": "2025-03-14",
-    "date_of_cause": "2025-01-10",
     "status": "open",
     "case_stage": "Arguments",
-    "case_category": "Goods",
     "date_of_next_hearing": "2025-08-20",
     "commission": {
       "id": 7,
-      "ext_id": 1023,
       "name": "District Consumer Commission Delhi-77",
-      "type": "district",
-      "state_id": 7
+      "type": "district"
     },
     "complainant": {
       "name": "Ramesh Kumar",
@@ -524,38 +643,17 @@ curl "http://localhost:8000/api/cases/42"
     },
     "respondent": {
       "name": "Samsung India Electronics Pvt. Ltd.",
-      "advocate_names": ["Adv. Rohit Mehra", "Adv. Anjali Singh"]
+      "advocate_names": ["Adv. Rohit Mehra"]
     },
     "hearings": [
       {
         "id": 301,
-        "court_room_hearing_id": "CRH-9921",
         "date": "2025-04-10",
         "next_date": "2025-05-15",
         "case_stage": "Admission",
         "proceeding_text": "<p>Case admitted...</p>",
         "sequence_number": 1,
         "daily_order_available": true
-      },
-      {
-        "id": 302,
-        "court_room_hearing_id": "CRH-9922",
-        "date": "2025-05-15",
-        "next_date": "2025-08-20",
-        "case_stage": "Arguments",
-        "proceeding_text": null,
-        "sequence_number": 2,
-        "daily_order_available": false
-      }
-    ],
-    "daily_orders": [
-      {
-        "id": 88,
-        "date": "2025-04-10",
-        "order_type_id": 1,
-        "pdf_fetched": true,
-        "pdf_storage_path": "s3://ejagriti-pdfs/orders/42/2025-04-10.pdf",
-        "pdf_fetched_at": "2025-04-11T02:15:00+00:00"
       }
     ],
     "last_fetched_at": "2025-07-10T04:32:11+00:00"
@@ -564,74 +662,65 @@ curl "http://localhost:8000/api/cases/42"
 ```
 
 **Notes:**
-- `hearings` are sorted by `hearing_sequence_number` ascending (chronological order).
-- `daily_orders` are sorted by `date_of_hearing` ascending.
-- `daily_order_available` is `true` when `daily_order_availability_status = 2` on the hearing row.
-- `proceeding_text` is sanitized HTML — dangerous tags (`script`, `iframe`, `style`, etc.) and all attributes are stripped by the ingestion service using an `nh3` allowlist. Safe formatting tags (`p`, `b`, `br`, `table`, etc.) are preserved. You can render it directly in the frontend; sandboxing is still good practice for defence-in-depth.
-- Returns `404 NOT_FOUND` if the `case_id` does not exist.
+- `hearings` are sorted by `hearing_sequence_number` ascending (chronological).
+- `proceeding_text` is sanitized HTML — safe to render directly in the frontend.
+- Returns `404 NOT_FOUND` if `case_id` does not exist.
 
 ---
 
-### 6.4 `POST /api/cases/<case_id>/voc` — Attach a VOC complaint to a case
+### 6.4 `GET /api/cases/<case_id>/hearings` — Hearing list
 
 **Blueprint:** `cases_bp` (`routes/cases.py`)
-**Purpose:** Manually link a VOC (Voice of Customer) complaint number to a case. Validates the VOC number against the complaint management system (CMS) and upserts the linkage in the DB.
-
-**Auth:** `cases:write`
-**Caching:** Not cached.
-
-**Request body (JSON):**
-```json
-{ "voc_number": 310256328 }
-```
+**Auth:** `cases:read`
+**Purpose:** Dedicated endpoint for the full hearing list for a case, in chronological order. Use when you need only hearings without the full case detail payload.
 
 **Example request:**
+
 ```bash
-curl -X POST http://localhost:8000/api/cases/101/voc \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer <token>" \
-  -d '{"voc_number": 310256328}'
+curl -H "Authorization: Bearer <token>" http://localhost:8000/api/cases/42/hearings
 ```
 
-**Example response (201):**
+**Example response:**
+
 ```json
 {
   "success": true,
-  "data": {
-    "case_id": 101,
-    "voc_number": 310256328
-  }
+  "data": [
+    {
+      "id": 301,
+      "court_room_hearing_id": "CRH-9921",
+      "date": "2025-04-10",
+      "next_date": "2025-05-15",
+      "case_stage": "Admission",
+      "proceeding_text": "<p>Case admitted...</p>",
+      "sequence_number": 1,
+      "daily_order_available": true
+    },
+    {
+      "id": 302,
+      "court_room_hearing_id": "CRH-9922",
+      "date": "2025-05-15",
+      "next_date": "2025-08-20",
+      "case_stage": "Arguments",
+      "proceeding_text": null,
+      "sequence_number": 2,
+      "daily_order_available": false
+    }
+  ]
 }
 ```
 
-**Error responses:**
-
-| Code | Error code | Condition |
-|------|-----------|-----------|
-| 400 | `INVALID_PARAMS` | `voc_number` missing or not an integer |
-| 404 | `NOT_FOUND` | `case_id` does not exist |
-| 404 | `VOC_NOT_FOUND` | `voc_number` not found in the CMS |
-| 409 | `VOC_CONFLICT` | `voc_number` is already linked to a different case |
-| 502 | `CMS_UNAVAILABLE` | Could not reach the complaint management system |
-
 **Notes:**
-- The caller's SSO bearer token is forwarded to the CMS transparently — no separate CMS credential is needed.
-- On success, both `voc_complaints` (upserted, `match_status=matched`) and `cases.voc_number` are updated atomically, keeping the no-VOC alert index accurate.
-- The CMS endpoint path is configured in `api/cms_client.py` (`_VOC_PATH`). Update it when the real CMS route is confirmed.
-- Set `EJAGRITI_CMS_BASE_URL` in the environment to point to the complaint management system.
+- Returns `404 NOT_FOUND` if `case_id` does not exist.
+- Ordered by `hearing_sequence_number ASC`.
 
 ---
 
-### 6.5 `GET /api/cases/<case_id>/orders` — Daily orders for a case
+### 6.5 `GET /api/cases/<case_id>/hearings/<hearing_id>/orders` — Daily orders
 
 **Blueprint:** `orders_bp` (`routes/orders.py`)
-**Purpose:** Paginated list of daily order PDF records for a single case, optionally filtered by date range.
-
-**Path parameters:**
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `case_id` | integer | Internal surrogate PK |
+**Auth:** `orders:read`
+**Purpose:** Paginated list of daily order records for a specific hearing.
 
 **Query parameters:**
 
@@ -639,13 +728,12 @@ curl -X POST http://localhost:8000/api/cases/101/voc \
 |-----------|------|---------|-------------|
 | `page` | integer | `1` | 1-based page number |
 | `per_page` | integer | `20` | Max `100` |
-| `from_date` | string | *(none)* | Include orders on or after this date (`YYYY-MM-DD`) |
-| `to_date` | string | *(none)* | Include orders on or before this date (`YYYY-MM-DD`) |
 
 **Example request:**
 
 ```bash
-curl "http://localhost:8000/api/cases/42/orders?from_date=2025-01-01&to_date=2025-06-30"
+curl -H "Authorization: Bearer <token>" \
+  "http://localhost:8000/api/cases/42/hearings/301/orders"
 ```
 
 **Example response:**
@@ -659,150 +747,61 @@ curl "http://localhost:8000/api/cases/42/orders?from_date=2025-01-01&to_date=202
       "date": "2025-04-10",
       "order_type_id": 1,
       "pdf_fetched": true,
-      "pdf_storage_path": "s3://ejagriti-pdfs/orders/42/2025-04-10.pdf",
       "pdf_fetched_at": "2025-04-11T02:15:00+00:00",
-      "pdf_fetch_error": null
+      "pdf_url": "/api/cases/42/hearings/301/orders/88/pdf"
     }
   ],
   "meta": {
-    "pagination": {
-      "page": 1,
-      "per_page": 20,
-      "total": 1,
-      "total_pages": 1
-    }
+    "pagination": { "page": 1, "per_page": 20, "total": 1, "total_pages": 1 }
   }
 }
 ```
 
 **Notes:**
+- `pdf_url` is the path to stream the PDF (section 6.6). It is `null` when `pdf_fetched = false`.
 - `order_type_id`: `1` = daily order, `2` = judgment (final order).
-- `pdf_fetched: false` means the PDF has been queued but not yet downloaded. `pdf_fetch_error` will contain the last error message if the fetch failed.
-- Results ordered by `date_of_hearing DESC`.
-- Returns `404 NOT_FOUND` if the `case_id` does not exist.
+- Returns `404 NOT_FOUND` if the case or hearing does not exist.
 
 ---
 
-### 6.6 `GET /api/cases/<case_id>/judgment` — Judgment for a case
+### 6.6 `GET /api/cases/<case_id>/hearings/<hearing_id>/orders/<order_id>/pdf` — Stream PDF
 
-**Blueprint:** `judgments_bp` (`routes/judgments.py`)
-**Purpose:** Returns the final judgment order (`order_type_id = 2`) for a case. Closed cases should have exactly one.
-
-**Path parameters:**
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `case_id` | integer | Internal surrogate PK |
+**Blueprint:** `orders_bp` (`routes/orders.py`)
+**Auth:** `orders:read`
+**Purpose:** Stream the daily order PDF from NFS storage. Returns the PDF inline so the browser renders it directly (suitable for `<iframe>` or `<a href=...>`).
 
 **Example request:**
 
 ```bash
-curl "http://localhost:8000/api/cases/42/judgment"
+curl -H "Authorization: Bearer <token>" \
+  "http://localhost:8000/api/cases/42/hearings/301/orders/88/pdf" \
+  --output order.pdf
 ```
 
-**Response — judgment exists:**
+**Error responses:**
 
-```json
-{
-  "success": true,
-  "data": {
-    "id": 91,
-    "date": "2025-06-30",
-    "pdf_fetched": true,
-    "pdf_storage_path": "s3://ejagriti-pdfs/judgments/42/2025-06-30.pdf",
-    "pdf_fetched_at": "2025-07-01T03:00:12+00:00"
-  }
-}
-```
+| Code | Error code | Condition |
+|------|-----------|-----------|
+| 404 | `NOT_FOUND` | Order/hearing/case combination does not exist |
+| 404 | `PDF_NOT_READY` | Order exists but `pdf_fetched = false` |
+| 404 | `FILE_NOT_FOUND` | `pdf_storage_path` is set but file is missing on NFS disk |
 
-**Response — case exists but no judgment yet:**
+**Path resolution:**
 
-```json
-{
-  "success": true,
-  "data": {}
-}
-```
-
-**Response — case does not exist:**
-
-```json
-{
-  "success": false,
-  "error": {
-    "code": "NOT_FOUND",
-    "message": "Case 9999 not found"
-  }
-}
-```
-
-**Notes:**
-- An empty `data: {}` with `success: true` is intentional — it signals the case is known but the judgment PDF has not been fetched yet. This lets the frontend distinguish "case not found" from "no judgment available".
-- If multiple judgment rows exist (edge case), the most recent by `date_of_hearing` is returned.
+If `pdf_storage_path` in the DB is a relative path, it is resolved against `EJAGRITI_PDF_STORAGE_ROOT` (default `/mnt/pdfs`). If it is already absolute, it is used as-is.
 
 ---
 
-### 6.7 `GET /api/commissions` — List all commissions
-
-**Blueprint:** `commissions_bp` (`routes/commissions.py`)
-**Purpose:** Returns the full list of all ~700+ consumer commissions in India (national, state, district). Cached for 1 hour.
-
-**No parameters.**
-
-**Example request:**
-
-```bash
-curl "http://localhost:8000/api/commissions"
-```
-
-**Example response:**
-
-```json
-{
-  "success": true,
-  "data": [
-    {
-      "id": 1,
-      "commission_id_ext": 1,
-      "name": "National Consumer Disputes Redressal Commission",
-      "type": "national",
-      "state_id": null,
-      "district_id": null,
-      "case_prefix_text": "CC/",
-      "parent_commission_id": null
-    },
-    {
-      "id": 7,
-      "commission_id_ext": 1023,
-      "name": "District Consumer Commission Delhi-77",
-      "type": "district",
-      "state_id": 7,
-      "district_id": 77,
-      "case_prefix_text": "DC/77/",
-      "parent_commission_id": 3
-    }
-  ]
-}
-```
-
-**Notes:**
-- Results ordered by `commission_type, name_en` (national first, then state, then district, each alphabetically).
-- Response is cached under key `"commissions_list"` with TTL `EJAGRITI_CACHE_TTL_SECONDS` (default 1 h). The cached list is populated on the first request after startup or cache expiry.
-- `parent_commission_id` links district → state; it is the internal surrogate `id`, not `commission_id_ext`.
-
----
-
-### 6.8 `GET /api/stats` — Aggregate statistics
+### 6.7 `GET /api/stats` — Aggregate statistics
 
 **Blueprint:** `stats_bp` (`routes/stats.py`)
+**Auth:** `stats:read`
 **Purpose:** Dashboard-level aggregate counts and a 12-month filing time series. Cached for 1 hour.
-
-**No parameters.**
 
 **Example request:**
 
 ```bash
-curl "http://localhost:8000/api/stats"
+curl -H "Authorization: Bearer <token>" http://localhost:8000/api/stats
 ```
 
 **Example response:**
@@ -822,7 +821,6 @@ curl "http://localhost:8000/api/stats"
     },
     "cases_per_month": [
       { "month": "2024-04", "count": 87 },
-      { "month": "2024-05", "count": 94 },
       { "month": "2025-03", "count": 112 }
     ],
     "last_ingestion_run": {
@@ -839,24 +837,16 @@ curl "http://localhost:8000/api/stats"
 ```
 
 **Notes:**
-- `cases_per_month` covers only the last 12 calendar months and only months where at least one case was filed. Months with zero filings are absent (not zero-filled) — account for this when rendering charts.
-- `last_ingestion_run` reflects only the single most recent `ingestion_runs` row. For full run history use `GET /api/batch/status`.
-- Cached under key `"stats"` with TTL `EJAGRITI_CACHE_TTL_SECONDS`.
+- `cases_per_month` covers only the last 12 calendar months; months with zero filings are absent.
+- Cached under key `"stats"` with TTL `EJAGRITI_CACHE_TTL_SECONDS` (default 1 h).
 
 ---
 
-### 6.9 `GET /health` — Health check
+### 6.8 `GET /health` — Health check
 
 **Blueprint:** `stats_bp` (`routes/stats.py`)
-**Purpose:** Liveness probe. Returns DB connectivity status and a summary of the last ingestion run. Designed for load balancer health checks.
-
-**No parameters.**
-
-**Example request:**
-
-```bash
-curl "http://localhost:8000/health"
-```
+**Auth:** Public (no token required)
+**Purpose:** Liveness probe. Returns DB connectivity status. Designed for load balancer health checks.
 
 **Response — healthy (HTTP 200):**
 
@@ -872,7 +862,6 @@ curl "http://localhost:8000/health"
       "total_calls": 2841,
       "success_count": 2798,
       "fail_count": 43,
-      "trigger_mode": "scheduler",
       "duration_seconds": 2851.2
     }
   }
@@ -882,28 +871,20 @@ curl "http://localhost:8000/health"
 **Response — DB unreachable (HTTP 503):**
 
 ```json
-{
-  "success": false,
-  "data": {
-    "db_ok": false,
-    "last_ingestion_run": null
-  }
-}
+{ "success": false, "data": { "db_ok": false, "last_ingestion_run": null } }
 ```
 
 **Notes:**
-- This endpoint is **not cached** — it always runs a live `SELECT 1` against the primary database.
-- The HTTP status code is `200` when `db_ok: true`, `503` when `db_ok: false`. Load balancers should check the status code, not the body.
-- `last_ingestion_run` will be `null` on a brand-new deployment before the first ingestion run completes.
+- Not cached — always runs a live `SELECT 1` against the primary database.
+- `last_ingestion_run` will be `null` on a brand-new deployment before the first ingestion run.
 
 ---
 
-### 6.10 `GET /api/batch/status` — Ingestion pipeline status
+### 6.9 `GET /api/batch/status` — Ingestion pipeline status
 
 **Blueprint:** `batch_bp` (`routes/batch.py`)
-**Purpose:** Live snapshot of the ingestion pipeline state. Shows recent run history, current queue depths (work still to do), and the most recent error log entries. Designed for developer debugging and operator dashboards; can be wired into a frontend monitoring panel.
-
-**This endpoint is not cached — it always queries live data.**
+**Auth:** `batch:read`
+**Purpose:** Live snapshot of the ingestion pipeline. Shows recent run history, queue depths, and recent errors. Not cached.
 
 **Query parameters:**
 
@@ -914,7 +895,7 @@ curl "http://localhost:8000/health"
 **Example request:**
 
 ```bash
-curl "http://localhost:8000/api/batch/status?runs=3"
+curl -H "Authorization: Bearer <token>" http://localhost:8000/api/batch/status?runs=3
 ```
 
 **Example response:**
@@ -929,39 +910,11 @@ curl "http://localhost:8000/api/batch/status?runs=3"
         "started_at": "2025-04-01T06:00:01+00:00",
         "finished_at": null,
         "status": "running",
-        "trigger_mode": "scheduler",
         "total_calls": 0,
         "success_count": 0,
         "fail_count": 0,
         "skip_count": 0,
-        "duration_seconds": null,
-        "notes": null
-      },
-      {
-        "run_id": 60,
-        "started_at": "2025-04-01T01:00:02+00:00",
-        "finished_at": "2025-04-01T01:47:33+00:00",
-        "status": "failed",
-        "trigger_mode": "scheduler",
-        "total_calls": 2841,
-        "success_count": 2798,
-        "fail_count": 43,
-        "skip_count": 210,
-        "duration_seconds": 2851.2,
-        "notes": null
-      },
-      {
-        "run_id": 59,
-        "started_at": "2025-03-31T01:00:01+00:00",
-        "finished_at": "2025-03-31T01:38:44+00:00",
-        "status": "completed",
-        "trigger_mode": "scheduler",
-        "total_calls": 2700,
-        "success_count": 2700,
-        "fail_count": 0,
-        "skip_count": 185,
-        "duration_seconds": 2323.0,
-        "notes": null
+        "duration_seconds": null
       }
     ],
     "queue_depths": {
@@ -974,10 +927,10 @@ curl "http://localhost:8000/api/batch/status?runs=3"
         "id": 512,
         "run_id": 60,
         "case_id": 1034,
-        "endpoint": "/courtmaster/courtRoom/judgement/v1/getDailyOrderJudgementPdf",
+        "endpoint": "/courtmaster/...",
         "http_status": 500,
         "error_type": "HTTP_ERROR",
-        "error_message": "Server returned 500 for case 1034 date 2025-03-28",
+        "error_message": "Server returned 500 for case 1034",
         "retry_count": 5,
         "created_at": "2025-04-01T01:44:12+00:00"
       }
@@ -986,11 +939,11 @@ curl "http://localhost:8000/api/batch/status?runs=3"
 }
 ```
 
-**`status` field derivation on each run:**
+**`status` field derivation:**
 
 | Value | Condition |
 |-------|-----------|
-| `"running"` | `finished_at` is `null` — the run has not closed its audit row yet |
+| `"running"` | `finished_at` is `null` |
 | `"failed"` | `finished_at` is set AND `fail_count > 0` |
 | `"completed"` | `finished_at` is set AND `fail_count == 0` |
 
@@ -998,11 +951,11 @@ curl "http://localhost:8000/api/batch/status?runs=3"
 
 | Field | What it counts |
 |-------|---------------|
-| `cases_pending_detail_fetch` | `cases` rows where `last_fetched_at IS NULL` — cases scraped from the list API but not yet enriched with full detail |
-| `pdfs_pending_fetch` | `daily_orders` rows where `pdf_fetched = false` — PDFs queued but not yet downloaded |
-| `failed_jobs_unresolved` | `failed_jobs` rows where `resolved = false` — jobs that exhausted all retries and are awaiting manual review or next sweep |
+| `cases_pending_detail_fetch` | `cases` rows where `last_fetched_at IS NULL` |
+| `pdfs_pending_fetch` | `daily_orders` rows where `pdf_fetched = false` |
+| `failed_jobs_unresolved` | `failed_jobs` rows where `resolved = false` |
 
-**`recent_errors`** always returns the 20 most recent rows from `ingestion_errors`, regardless of the `runs` parameter.
+`recent_errors` always returns the 20 most recent rows from `ingestion_errors`.
 
 ---
 
@@ -1014,7 +967,6 @@ curl "http://localhost:8000/api/batch/status?runs=3"
 
 | Endpoint | Cache key | TTL | Notes |
 |----------|-----------|-----|-------|
-| `GET /api/commissions` | `"commissions_list"` | `EJAGRITI_CACHE_TTL_SECONDS` | Full list (~700 rows). Populated on first hit after startup or expiry. |
 | `GET /api/stats` | `"stats"` | `EJAGRITI_CACHE_TTL_SECONDS` | Aggregate counts + monthly series. Stale counts are acceptable for a dashboard. |
 | All other endpoints | — | — | Not cached. DB query on every request. |
 
@@ -1031,29 +983,23 @@ REDIS_URL set     →  CACHE_TYPE = "RedisCache"   (shared across workers + repl
 REDIS_URL absent  →  CACHE_TYPE = "SimpleCache"  (in-process dictionary, per-worker)
 ```
 
-In `docker-compose.yml` the `api` service always sets `REDIS_URL=redis://redis:6379/0`, so Redis is the backend in all compose-based environments.
-
 ---
 
 ### 7.3 How to invalidate the cache manually
 
-There is no cache-bust endpoint. To force fresh data before the TTL expires:
-
 **Redis (production / docker-compose):**
 
 ```bash
-redis-cli -u redis://localhost:6379/0 DEL commissions_list stats
+redis-cli -u redis://localhost:6379/0 DEL stats
 ```
 
 **SimpleCache (local dev without Redis):**
 
-Restart the Flask process — SimpleCache is in-process and does not survive restarts.
+Restart the Flask process — SimpleCache does not survive restarts.
 
 ---
 
 ### 7.4 Cache usage pattern in routes
-
-The two cached routes follow the same manual read-through pattern (Flask-Caching's `@cache.cached` decorator is not used because the `success_response()` wrapper makes the cache key ambiguous):
 
 ```python
 cached = cache.get("stats")
@@ -1065,7 +1011,7 @@ cache.set("stats", data)       # uses CACHE_DEFAULT_TIMEOUT
 return success_response(data)
 ```
 
-The cache stores the raw `data` dict, not the full HTTP response. This means the `success` wrapper and HTTP headers are always freshly generated even on a cache hit.
+The cache stores the raw `data` dict, not the full HTTP response. The `success` wrapper and HTTP headers are always freshly generated even on a cache hit.
 
 ---
 
@@ -1087,15 +1033,13 @@ Flask-Limiter translates this into `"100 per minute"` and applies it to every ro
 
 ### 8.2 How limits are keyed
 
-The limiter uses `get_remote_address` as its key function — the client's IP address from `request.remote_addr`. Each IP gets its own independent counter.
+The limiter uses `get_remote_address` as its key function — the client's IP address from `request.remote_addr`.
 
 **Behind a reverse proxy (nginx, AWS ALB, Cloud Run):** `request.remote_addr` will be the proxy IP, not the real client IP. Fix this by setting Flask's `TRUSTED_PROXIES` or using `ProxyFix` middleware, otherwise all clients share a single counter.
 
 ---
 
 ### 8.3 Rate limit exceeded response
-
-When the limit is hit Flask-Limiter triggers the `429` error handler registered in `app.py`, which returns the standard error envelope:
 
 ```json
 {
@@ -1113,14 +1057,10 @@ HTTP status: `429`.
 
 ### 8.4 Storage backend
 
-Rate limit counters use the same `REDIS_URL` as the cache:
-
 ```
 REDIS_URL set     →  RATELIMIT_STORAGE_URI = REDIS_URL    (shared across workers)
 REDIS_URL absent  →  RATELIMIT_STORAGE_URI = "memory://"  (per-process only)
 ```
-
-In development without Redis the limit is per-worker, not per-IP across the whole process group. This is acceptable locally but must not reach production.
 
 ---
 
@@ -1135,8 +1075,6 @@ Follow these four steps every time. The pattern is consistent across all existin
 All database logic lives here. Routes must not contain SQL or ORM calls.
 
 ```python
-# db/queries.py
-
 def get_cases_by_stage(stage: str, page: int = 1, per_page: int = 20) -> dict[str, Any]:
     """
     Return paginated cases filtered by case_stage_name.
@@ -1169,36 +1107,21 @@ def get_cases_by_stage(stage: str, page: int = 1, per_page: int = 20) -> dict[st
 
 **Rules:**
 - Always use `get_session(read_only=True)` for SELECT queries.
-- Return plain Python dicts/lists — never ORM objects. Routes and tests should not need to touch SQLAlchemy.
+- Return plain Python dicts/lists — never ORM objects.
 - Add a docstring with Args and Returns.
 
 ---
 
-### Step 2 — Create `routes/foo.py`
+### Step 2 — Create or extend `routes/<resource>.py`
 
-One Blueprint per resource group. Keep route handlers thin — validate inputs, call the query function, wrap the result.
+Keep route handlers thin — validate inputs, call the query function, wrap the result. Add `@require_permission()` for every protected route.
 
 ```python
-# routes/stages.py
-
-from __future__ import annotations
-from flask import Blueprint, request
-from db.queries import get_cases_by_stage
-from schemas.responses import error_response, success_response
-
-stages_bp = Blueprint("stages", __name__, url_prefix="/api/cases")
-
+from auth import require_permission
 
 @stages_bp.get("/by-stage")
+@require_permission("cases:read")
 def list_cases_by_stage():
-    """
-    Return cases filtered by stage name.
-
-    Query params:
-      - stage (str, required): Stage name substring to match.
-      - page (int, default 1)
-      - per_page (int, default 20, max 100)
-    """
     stage = request.args.get("stage", "").strip()
     if not stage:
         return error_response("INVALID_PARAMS", "stage is required", 400)
@@ -1210,53 +1133,30 @@ def list_cases_by_stage():
         return error_response("INVALID_PARAMS", "page and per_page must be integers", 400)
 
     result = get_cases_by_stage(stage=stage, page=page, per_page=per_page)
-    return success_response(
-        data=result["items"],
-        page=page,
-        per_page=per_page,
-        total=result["total"],
-    )
+    return success_response(data=result["items"], page=page, per_page=per_page, total=result["total"])
 ```
 
 ---
 
 ### Step 3 — Register the Blueprint in `app.py`
 
-Add the import and `register_blueprint` call inside `create_app()` alongside the existing blueprints:
-
 ```python
 # app.py — inside create_app(), in the Blueprints section
-
-from routes.stages import stages_bp   # add this line
-
-app.register_blueprint(stages_bp)     # add this line
+from routes.stages import stages_bp
+api_docs.register_blueprint(stages_bp)
 ```
-
-The order of `register_blueprint` calls does not matter for correctness, but keep them alphabetical for readability.
 
 ---
 
-### Step 4 — Add a Marshmallow schema (optional but recommended)
+### Step 4 — Add a permission to `auth.py` if needed
 
-Schemas in `schemas/responses.py` serve as living documentation and can be used for outbound validation in tests. Add a schema that mirrors the dict shape returned by your query function:
-
-```python
-# schemas/responses.py
-
-class CaseByStageSchema(Schema):
-    """Lightweight case item for the by-stage endpoint."""
-    case_id    = fields.Int()
-    case_number = fields.Str()
-    stage      = fields.Str(allow_none=True)
-```
-
-Schemas are not automatically applied to responses — they are used explicitly in tests or for documentation:
+If the new endpoint introduces a new permission scope, add it to the `PERMISSIONS` dict in `auth.py` and ensure the SSO has a matching `permissionName` value:
 
 ```python
-# In a test
-from schemas.responses import CaseByStageSchema
-errors = CaseByStageSchema(many=True).validate(response.json["data"])
-assert errors == {}
+PERMISSIONS: dict[str, str] = {
+    ...
+    "stages:read": "View cases by stage",
+}
 ```
 
 ---
@@ -1266,8 +1166,6 @@ assert errors == {}
 ---
 
 ### 10.1 Option A — Docker Compose (recommended)
-
-This is the closest to production and requires no manual Python environment setup. It starts Postgres, Redis, runs migrations, starts the ingestion service, and starts the API — all in one command.
 
 ```bash
 # From the repo root
@@ -1280,59 +1178,33 @@ The API will be available at `http://localhost:8000`.
 **Useful compose commands:**
 
 ```bash
-# Rebuild only the API image after code changes
-docker compose up --build api
-
-# Tail API logs only
-docker compose logs -f api
-
-# Run migrations without starting other services
-docker compose run --rm migrations
-
-# Open a psql shell against the compose Postgres
-docker compose exec postgres psql -U ejagriti ejagriti
+docker compose up --build api       # Rebuild only the API image
+docker compose logs -f api          # Tail API logs
+docker compose run --rm migrations  # Run migrations only
+docker compose exec postgres psql -U ejagriti ejagriti  # psql shell
 ```
-
-**How the models shim works in Docker:**
-
-The `api/Dockerfile` COPYs only the `api/` directory into `/app`. But `api/models.py` needs `ingestion/db/models.py`. This works because the ingestion Dockerfile (used for the `migrations` service) copies the ingestion package, and the API container relies on `models.py` appending `../ingestion` to `sys.path` at runtime. In the container `../ingestion` resolves to `/ingestion` — make sure the `api/Dockerfile` or the compose volume mounts make that path available if you customise the image.
 
 ---
 
 ### 10.2 Option B — Flask dev server (no Docker)
 
-Use this when you want fast iteration with auto-reload, without rebuilding images.
-
-**Prerequisites:** Postgres running locally (or the compose Postgres with `docker compose up postgres redis`).
+**Prerequisites:** Postgres running locally.
 
 ```bash
-# 1. Create and activate a virtual environment
 cd api
 python -m venv .venv
 source .venv/bin/activate        # Windows: .venv\Scripts\activate
-
-# 2. Install dependencies
 pip install -r requirements.txt
-
-# 3. Install ingestion dependencies (needed for the models shim)
 pip install -r ../ingestion/requirements.txt
 
-# 4. Set environment variables
 cp ../.env.example .env
-# Edit .env — set DATABASE_URL at minimum
+# Edit .env — set DATABASE_URL, EJAGRITI_SSO_URL, EJAGRITI_SERVICE_ID at minimum
 
-# 5. Run migrations (from ingestion/ directory)
-cd ../ingestion
-alembic -c alembic.ini upgrade head
-cd ../api
+# Run migrations
+cd ../ingestion && alembic -c alembic.ini upgrade head && cd ../api
 
-# 6. Start the dev server
 FLASK_ENV=development flask --app app:create_app run --reload --port 8000
 ```
-
-**PYTHONPATH for the models shim:**
-
-The shim in `api/models.py` appends `../ingestion` to `sys.path` dynamically, so no manual `PYTHONPATH` export is needed. If you see `ModuleNotFoundError: No module named 'db.models'` it means the relative path resolution failed — verify you are running Flask from within the `api/` directory, not the repo root.
 
 ---
 
@@ -1350,33 +1222,29 @@ gunicorn "app:create_app()" \
   --error-logfile -
 ```
 
-This matches the `CMD` in `api/Dockerfile` exactly.
-
 ---
 
 ### 10.4 Common pitfalls
 
 **`RuntimeError: DATABASE_URL environment variable is not set`**
 
-`db/session.py` raises this on the first DB operation if `DATABASE_URL` is missing. Check that your `.env` file is in the `api/` directory (not the repo root) and that `python-dotenv` is loading it. The `load_dotenv()` call is inside `create_app()`, so it only fires when the app factory runs — not on bare module import.
+Check that your `.env` file is in the `api/` directory and that `python-dotenv` is loading it. `load_dotenv()` is called inside `create_app()`, not on module import.
 
 ---
 
 **`ModuleNotFoundError: No module named 'db'` or `No module named 'db.models'`**
 
-This means `api/models.py` could not find the ingestion package. The shim builds the path as:
+The shim in `api/models.py` builds the path as:
 
 ```python
 _ingestion_path = os.path.join(os.path.dirname(__file__), "..", "ingestion")
 ```
 
-`__file__` is the absolute path to `api/models.py`. If you moved files or are running from an unexpected working directory, print `_ingestion_path` to verify it resolves to a real directory containing `db/models.py`.
+Verify you are running Flask from within the `api/` directory and that `../ingestion/db/models.py` exists.
 
 ---
 
 **`psycopg2.OperationalError: could not connect to server`**
-
-The `DATABASE_URL` host is wrong for your environment:
 
 | Environment | Correct host in `DATABASE_URL` |
 |-------------|-------------------------------|
@@ -1388,19 +1256,29 @@ The `DATABASE_URL` host is wrong for your environment:
 
 **`sqlalchemy.exc.ProgrammingError: relation "cases" does not exist`**
 
-Migrations have not been run yet. Run them from the `ingestion/` directory:
+Migrations have not been run:
 
 ```bash
-cd ingestion
-alembic -c alembic.ini upgrade head
+cd ingestion && alembic -c alembic.ini upgrade head
 ```
+
+---
+
+**All requests return `403 FORBIDDEN — You do not have access to this service`**
+
+The user's SSO object does not include the service ID configured in `EJAGRITI_SERVICE_ID`. Either the service ID is wrong, or the user has not been granted access to this service in the SSO. Check the `permission_denied` / `sso_unexpected_shape` log entries.
+
+---
+
+**All requests return `500 CONFIGURATION_ERROR — SSO service is not configured`**
+
+`EJAGRITI_SSO_URL` is not set in the environment. Add it to your `.env`.
 
 ---
 
 **Stale cached responses in development**
 
-If you are testing code that changes aggregate data and `/api/stats` or `/api/commissions` still return old values, the cache TTL has not expired yet. Either wait for it, or if running without Redis, restart the Flask process. If running with Redis, delete the keys:
-
 ```bash
-redis-cli DEL stats commissions_list
+redis-cli DEL stats          # if running with Redis
+# or restart the Flask process if using SimpleCache
 ```

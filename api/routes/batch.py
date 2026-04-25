@@ -7,47 +7,27 @@ Not cached — always returns live data from the DB.
 
 from __future__ import annotations
 
-from flask import Blueprint, request
+from flask_smorest import Blueprint
 
 from auth import require_permission
 from db.queries import get_batch_status
-from schemas.responses import error_response, success_response
+from schemas.responses import BatchQuerySchema, BatchStatusSchema, error_response, success_response
 
-batch_bp = Blueprint("batch", __name__, url_prefix="/api/batch")
+batch_bp = Blueprint("batch", __name__, url_prefix="/api/batch",
+                     description="Ingestion pipeline status")
 
 
 @batch_bp.get("/status")
+@batch_bp.arguments(BatchQuerySchema, location="query")
+@batch_bp.response(200, BatchStatusSchema)
 @require_permission("batch:read")
-def batch_status():
+def batch_status(args):
     """
     Return live ingestion pipeline status.
 
-    Query params:
-      - runs (int, default 10, max 50): Number of recent ingestion runs to include.
-
-    Response shape:
-      {
-        "recent_runs":  [ { run_id, started_at, finished_at, status,
-                            trigger_mode, total_calls, success_count,
-                            fail_count, skip_count, duration_seconds, notes } ],
-        "queue_depths": {
-          "cases_pending_detail_fetch": int,
-          "pdfs_pending_fetch":         int,
-          "failed_jobs_unresolved":     int
-        },
-        "recent_errors": [ { id, run_id, case_id, endpoint, http_status,
-                              error_type, error_message, retry_count, created_at } ]
-      }
-
-    ``status`` on each run is derived:
-      "running"   — run_finished_at is NULL
-      "failed"    — run finished but fail_count > 0
-      "completed" — run finished with fail_count == 0
+    Includes recent runs, queue depths, and recent error records.
+    The `runs` param controls how many recent runs to return (max 50).
     """
-    try:
-        runs = min(50, max(1, int(request.args.get("runs", 10))))
-    except ValueError:
-        return error_response("INVALID_PARAMS", "runs must be an integer", 400)
-
+    runs = min(50, max(1, args.get("runs", 10)))
     data = get_batch_status(runs=runs)
     return success_response(data)
