@@ -181,6 +181,15 @@ def create_app(config_object: object | None = None) -> Flask:
         log.error("unhandled_exception", error=str(exc))
         return error_response("INTERNAL_ERROR", "An unexpected error occurred.", 500)
 
+    # ------------------------------------------------------------------
+    # Startup DB check — refuse to start if the database is unreachable
+    # ------------------------------------------------------------------
+    from db.session import check_db_connection
+    if not check_db_connection():
+        log.error("startup_db_check_failed")
+        raise RuntimeError("Cannot connect to database — refusing to start")
+    log.info("startup_db_check_passed")
+
     log.info("flask_app_created", env=os.environ.get("FLASK_ENV", "production"))
     return app
 
