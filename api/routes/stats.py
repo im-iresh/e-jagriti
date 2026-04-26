@@ -9,6 +9,7 @@ from flask_smorest import Blueprint
 
 from auth import require_permission
 from db.queries import get_health_data, get_stats
+from extensions import cache
 from schemas.responses import HealthSchema, StatsSchema, success_response
 
 stats_bp = Blueprint("stats", __name__, description="Statistics and health")
@@ -25,8 +26,6 @@ def aggregate_stats():
     cases filed per month (last 12 months), and last ingestion run summary.
     Cached for CACHE_DEFAULT_TIMEOUT seconds (default 1 h).
     """
-    from app import cache  # type: ignore[import]
-
     cached = cache.get("stats")
     if cached is not None:
         return success_response(cached)

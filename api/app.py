@@ -17,17 +17,8 @@ import sys
 
 import structlog
 from flask import Flask
-from flask_caching import Cache
-from flask_cors import CORS
-from flask_limiter import Limiter
-from flask_limiter.util import get_remote_address
-from flask_smorest import Api
 
-# Module-level singletons so routes can import them directly.
-cache    = Cache()
-cors     = CORS()
-limiter  = Limiter(key_func=get_remote_address)
-api_docs = Api()
+from extensions import api_docs, cache, cors, limiter
 
 
 def _configure_logging(log_level: str = "INFO", log_dir: str = "logs") -> None:
@@ -192,3 +183,43 @@ def create_app(config_object: object | None = None) -> Flask:
 
     log.info("flask_app_created", env=os.environ.get("FLASK_ENV", "production"))
     return app
+
+if __name__ == "__main__":
+    # _env = os.environ.get("FLASK_ENV", "production")
+    _env = os.environ.get("FLASK_ENV", "development")
+    if _env == "development":
+        # Flask built-in dev server: auto-reloader + debugger
+        _app = create_app()
+        _app.run(
+            host="0.0.0.0",
+            port=int(os.environ.get("EJAGRITI_API_PORT", "5000")),
+            debug=True,
+        )
+    else:
+        # Production: gunicorn in-process (same as Dockerfile CMD)
+        from gunicorn.app.base import BaseApplication  # type: ignore[import]
+
+        class _StandaloneApp(BaseApplication):
+            def __init__(self, application, options=None):
+                self.options = options or {}
+                self.application = application
+                super().__init__()
+
+            def load_config(self):
+                for key, value in self.options.items():
+                    self.cfg.set(key.lower(), value)
+
+            def load(self):
+                return self.application
+
+        _options = {
+            "bind":         f"0.0.0.0:{os.environ.get('EJAGRITI_API_PORT', '8000')}",
+            "workers":      int(os.environ.get("EJAGRITI_GUNICORN_WORKERS", "4")),
+            "threads":      int(os.environ.get("EJAGRITI_GUNICORN_THREADS", "2")),
+            "worker_class": "sync",
+            "timeout":      60,
+            "accesslog":    "-",
+            "errorlog":     "-",
+            "loglevel":     "info",
+        }
+        _StandaloneApp(create_app(), _options).run()

@@ -1,0 +1,282 @@
+{
+  "info": {
+    "name": "eJagriti Samsung Case API",
+    "_postman_id": "ejagriti-samsung-case-api",
+    "description": "eJagriti consumer case management API.\n\nSet the **baseUrl** and **bearerToken** collection variables before running. All endpoints except `/health` use the collection-level Bearer token automatically.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "auth": {
+    "type": "bearer",
+    "bearer": [
+      {
+        "key": "token",
+        "value": "{{bearerToken}}",
+        "type": "string"
+      }
+    ]
+  },
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:5000",
+      "description": "Base URL of the running API server (no trailing slash)"
+    },
+    {
+      "key": "bearerToken",
+      "value": "",
+      "description": "JWT / Bearer token from your SSO — set once here, all requests inherit it"
+    },
+    {
+      "key": "caseId",
+      "value": "1",
+      "description": "Sample case ID used in parameterised requests"
+    },
+    {
+      "key": "hearingId",
+      "value": "1",
+      "description": "Sample hearing ID used in parameterised requests"
+    },
+    {
+      "key": "orderId",
+      "value": "1",
+      "description": "Sample order ID used in the PDF endpoint"
+    }
+  ],
+  "item": [
+    {
+      "name": "Health",
+      "item": [
+        {
+          "name": "Health Check",
+          "request": {
+            "auth": {
+              "type": "noauth"
+            },
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/health",
+              "host": ["{{baseUrl}}"],
+              "path": ["health"]
+            },
+            "description": "Public endpoint. Returns DB connectivity status and last ingestion summary. No auth required. Returns 503 when the database is unreachable."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Cases",
+      "item": [
+        {
+          "name": "List Cases",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/api/cases?page=1&per_page=20",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "cases"],
+              "query": [
+                {
+                  "key": "page",
+                  "value": "1",
+                  "description": "Page number (default: 1)"
+                },
+                {
+                  "key": "per_page",
+                  "value": "20",
+                  "description": "Results per page (default: 20, max: 100)"
+                },
+                {
+                  "key": "status",
+                  "value": "",
+                  "description": "Filter by case status (e.g. open, closed, pending). Omit or pass 'all' for no filter.",
+                  "disabled": true
+                },
+                {
+                  "key": "commission_type",
+                  "value": "",
+                  "description": "Filter by commission type",
+                  "disabled": true
+                },
+                {
+                  "key": "search",
+                  "value": "",
+                  "description": "Free-text search across case fields",
+                  "disabled": true
+                }
+              ]
+            },
+            "description": "Paginated list of cases. Ordered by nearest upcoming hearing date first, then most recent filing date, then case id descending."
+          }
+        },
+        {
+          "name": "Alerts — All",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/api/cases/alerts",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "cases", "alerts"]
+            },
+            "description": "Returns all alert sections (no_voc + hearing_soon) when no query params are supplied."
+          }
+        },
+        {
+          "name": "Alerts — No VOC only",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/api/cases/alerts?no_voc=Y",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "cases", "alerts"],
+              "query": [
+                {
+                  "key": "no_voc",
+                  "value": "Y",
+                  "description": "Return only cases with no linked VOC complaint"
+                },
+                {
+                  "key": "hearing_soon",
+                  "value": "Y",
+                  "description": "Return only cases whose next hearing is within 2 days",
+                  "disabled": true
+                }
+              ]
+            },
+            "description": "Returns only the no_voc alert section."
+          }
+        },
+        {
+          "name": "Alerts — Hearing Soon only",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/api/cases/alerts?hearing_soon=Y",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "cases", "alerts"],
+              "query": [
+                {
+                  "key": "no_voc",
+                  "value": "Y",
+                  "description": "Return only cases with no linked VOC complaint",
+                  "disabled": true
+                },
+                {
+                  "key": "hearing_soon",
+                  "value": "Y",
+                  "description": "Return only cases whose next hearing is within 2 days"
+                }
+              ]
+            },
+            "description": "Returns only the hearing_soon alert section."
+          }
+        },
+        {
+          "name": "Get Case Detail",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/api/cases/{{caseId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "cases", "{{caseId}}"]
+            },
+            "description": "Full nested detail for a single case, including embedded hearings. Set the `caseId` collection variable or replace inline."
+          }
+        },
+        {
+          "name": "List Hearings for Case",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/api/cases/{{caseId}}/hearings",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "cases", "{{caseId}}", "hearings"]
+            },
+            "description": "All hearings for a case ordered by sequence number ascending. Returns 404 if case does not exist."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Orders",
+      "item": [
+        {
+          "name": "List Orders for Hearing",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/api/cases/{{caseId}}/hearings/{{hearingId}}/orders?page=1&per_page=20",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "cases", "{{caseId}}", "hearings", "{{hearingId}}", "orders"],
+              "query": [
+                {
+                  "key": "page",
+                  "value": "1",
+                  "description": "Page number (default: 1)"
+                },
+                {
+                  "key": "per_page",
+                  "value": "20",
+                  "description": "Results per page (default: 20, max: 100)"
+                }
+              ]
+            },
+            "description": "Paginated daily orders for a specific hearing. Each item includes a `pdf_url` field when the PDF has been fetched, otherwise null. Returns 404 if case or hearing does not exist."
+          }
+        },
+        {
+          "name": "Serve Order PDF",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/api/cases/{{caseId}}/hearings/{{hearingId}}/orders/{{orderId}}/pdf",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "cases", "{{caseId}}", "hearings", "{{hearingId}}", "orders", "{{orderId}}", "pdf"]
+            },
+            "description": "Streams the daily order PDF inline from NFS storage.\n\nPossible 404 error codes:\n- `PDF_NOT_READY` — order exists but PDF has not been fetched yet\n- `FILE_NOT_FOUND` — pdf_storage_path set but file missing on disk\n- `NOT_FOUND` — order/hearing/case combination does not exist"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Stats",
+      "item": [
+        {
+          "name": "Aggregate Stats",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/api/stats",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "stats"]
+            },
+            "description": "Aggregate case statistics: total/open/closed/pending counts, breakdown by commission type, cases filed per month (last 12 months), and last ingestion run summary. Cached for 1 hour by default."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Batch",
+      "item": [
+        {
+          "name": "Batch Status",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/api/batch/status?runs=10",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "batch", "status"],
+              "query": [
+                {
+                  "key": "runs",
+                  "value": "10",
+                  "description": "Number of recent pipeline runs to return (default: 10, max: 50)"
+                }
+              ]
+            },
+            "description": "Live ingestion pipeline status. Includes recent runs, queue depths, and recent error records. Not cached."
+          }
+        }
+      ]
+    }
+  ]
+}

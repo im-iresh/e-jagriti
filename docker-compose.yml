@@ -89,6 +89,9 @@ services:
       EJAGRITI_CACHE_TTL_SECONDS: ${EJAGRITI_CACHE_TTL_SECONDS:-3600}
       EJAGRITI_SA_POOL_SIZE: ${EJAGRITI_SA_POOL_SIZE:-5}
       EJAGRITI_SA_MAX_OVERFLOW: ${EJAGRITI_SA_MAX_OVERFLOW:-10}
+      EJAGRITI_SSO_URL: ${EJAGRITI_SSO_URL:-https://sso.example.com}
+      EJAGRITI_SERVICE_ID: ${EJAGRITI_SERVICE_ID:-}
+      EJAGRITI_PDF_STORAGE_ROOT: ${EJAGRITI_PDF_STORAGE_ROOT:-/mnt/pdfs}
     depends_on:
       postgres:
         condition: service_healthy
